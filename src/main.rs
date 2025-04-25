@@ -349,5 +349,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let content = st.queue.join("\n");
         fs::write(path, content).await?;
     }
+    // ensure terminal is restored if still in raw mode
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
 }
