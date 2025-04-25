@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reqwest = { version = "0.11", features = ["json", "stream", "gzip", "brotli", "deflate", "rustls-tls"] }
+tokio = { version = "1.28", features = ["full"] }
+scraper = "0.13"
+url = "2.2"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+tui = "0.19"
+crossterm = "0.26"
+sanitize-filename = "0.5"
