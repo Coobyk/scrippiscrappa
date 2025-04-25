@@ -47,6 +47,8 @@ struct Args {
     concurrency: usize,
     #[clap(short = 'r', long, help = "Resume from saved state file")]
     resume: Option<String>,
+    #[clap(long, help = "Force CI output")]
+    ci: bool,
 }
 
 struct AppState {
@@ -401,8 +403,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    // setup TUI (skip in CI)
-    if std::env::var("CI").is_err() {
+    // setup TUI (skip in CI or when --ci flag is set)
+    if !args.ci && std::env::var("CI").is_err() {
         let ui_state = state.clone();
         let shutdown_ui = shutdown.clone();
         let mut stdout = io::stdout();
