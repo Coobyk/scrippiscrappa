@@ -27,6 +27,12 @@ jobs:
               run: |
                   cargo build --release --target ${{ matrix.target }}
 
+            - name: Test website scraping via binary
+              run: |
+                  echo "Testing website scraping via compiled binary"
+                  chmod +x target/${{ matrix.target }}/release/scrippiscrappa
+                  ./target/${{ matrix.target }}/release/scrippiscrappa https://coobyk.pp.ua || (echo 'Binary scrape failed' && exit 1)
+
             - name: Upload artifact
               uses: actions/upload-artifact@v4
               with:
