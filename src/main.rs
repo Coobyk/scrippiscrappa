@@ -382,13 +382,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown = shutdown.clone();
         tokio::task::spawn_blocking(move || {
             loop {
-                if event::poll(Duration::from_millis(200)).unwrap() {
-                    if let Event::Key(KeyEvent {
+                if event::poll(Duration::from_millis(200)).unwrap_or(false) {
+                    if let Ok(Event::Key(KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
                         ..
-                    }) = event::read().unwrap()
-                    {
+                    })) = event::read() {
                         shutdown.store(true, Ordering::SeqCst);
                         break;
                     }
