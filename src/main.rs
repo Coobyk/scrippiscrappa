@@ -219,11 +219,27 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(67), Constraint::Percentage(33)].as_ref())
         .split(f.size());
-    let queue_items: Vec<ListItem> = st.queue.iter().map(|u| ListItem::new(u.clone())).collect();
+    let queue_items: Vec<ListItem> = st
+        .queue
+        .iter()
+        .map(|u| {
+            let disp = u
+                .strip_prefix("https://")
+                .or_else(|| u.strip_prefix("http://"))
+                .unwrap_or(u);
+            ListItem::new(disp.to_string())
+        })
+        .collect();
     let inprog_items: Vec<ListItem> = st
         .in_progress
         .iter()
-        .map(|u| ListItem::new(u.clone()))
+        .map(|u| {
+            let disp = u
+                .strip_prefix("https://")
+                .or_else(|| u.strip_prefix("http://"))
+                .unwrap_or(u);
+            ListItem::new(disp.to_string())
+        })
         .collect();
     let queue_list = List::new(queue_items).block(Block::default().borders(Borders::ALL).title(
         Spans::from(Span::raw(format!("Queue ({})", st.queue.len()))),
@@ -364,8 +380,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let content = st
             .queue
             .iter()
-            .map(|u| u.strip_prefix("https://").unwrap_or(u))
-            .map(|u| u.strip_prefix("http://").unwrap_or(u))
+            .map(|u| {
+                u.strip_prefix("https://")
+                    .or_else(|| u.strip_prefix("http://"))
+                    .unwrap_or(u)
+            })
             .collect::<Vec<&str>>()
             .join("\n");
         fs::write(path, content).await?;
