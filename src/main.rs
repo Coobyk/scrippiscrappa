@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, io, path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
 use clap::Parser;
 use crossterm::{
@@ -247,8 +247,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut st = state.lock().await;
         st.enqueue(start_url.clone());
     }
+    // setup Ctrl+C flag
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.store(true, Ordering::SeqCst);
+        });
+    }
     // setup TUI
     let ui_state = state.clone();
+    let shutdown_ui = shutdown.clone();
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen)?;
@@ -263,6 +273,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
             }
+            if shutdown_ui.load(Ordering::SeqCst) {
+                break;
+            }
             time::sleep(Duration::from_millis(200)).await;
         }
         disable_raw_mode().unwrap();
@@ -272,6 +285,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder().user_agent("scrippiscrappa").build()?;
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         let next = {
             let mut st = state.lock().await;
             st.dequeue()
@@ -283,22 +299,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client_clone = client.clone();
             let base = output_folder.clone();
             let start_host = start_host.clone();
+            let shutdown_task = shutdown.clone();
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
                     st.start(url.clone());
                 }
-                if let Err(e) = process_url(
-                    &client_clone,
-                    &url,
-                    &base,
-                    state_clone.clone(),
-                    visited_clone.clone(),
-                    &start_host,
-                )
-                .await
-                {
-                    eprintln!("Error processing {}: {}", url, e);
+                if !shutdown_task.load(Ordering::SeqCst) {
+                    let _ = process_url(
+                        &client_clone,
+                        &url,
+                        &base,
+                        state_clone.clone(),
+                        visited_clone.clone(),
+                        &start_host,
+                    ).await;
                 }
                 {
                     let mut st = state_clone.lock().await;
