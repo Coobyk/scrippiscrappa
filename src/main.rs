@@ -4,6 +4,7 @@ use clap::Parser;
 use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    event::{self, Event, KeyEvent, KeyCode, KeyModifiers},
 };
 use reqwest::Client;
 use sanitize_filename::sanitize;
@@ -254,6 +255,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             shutdown.store(true, Ordering::SeqCst);
+        });
+    }
+    // spawn key listener for Ctrl+C in raw mode
+    {
+        let shutdown = shutdown.clone();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                if event::poll(Duration::from_millis(200)).unwrap() {
+                    if let Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) = event::read().unwrap() {
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
         });
     }
     // setup TUI
