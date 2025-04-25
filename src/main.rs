@@ -18,6 +18,8 @@ use crossterm::{
 use reqwest::Client;
 use sanitize_filename::sanitize;
 use scraper::{Html, Selector};
+use serde::{Serialize, Deserialize};
+use serde_json;
 use tokio::{
     fs,
     sync::{Mutex, Semaphore},
@@ -32,7 +34,7 @@ use tui::{
 };
 use url::Url;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[clap(name = "scrippiscrappa", version)]
 struct Args {
     #[clap(help = "Start URL to scrape")]
@@ -43,6 +45,8 @@ struct Args {
     save_queue: Option<String>,
     #[clap(short, long, default_value_t = 8, help = "Parallel download count")]
     concurrency: usize,
+    #[clap(long, help = "Resume from saved state file")]
+    resume: Option<String>,
 }
 
 struct AppState {
@@ -88,6 +92,14 @@ impl AppState {
         self.in_progress.retain(|u| u != url);
         self.completed.push(url.clone());
     }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SavedState {
+    args: Args,
+    queue: Vec<String>,
+    in_progress: Vec<String>,
+    completed: Vec<String>,
 }
 
 fn get_local_path(url: &Url, base: &str) -> PathBuf {
@@ -315,7 +327,7 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let start_url = args.url.clone();
     let output_folder = args.output.clone().unwrap_or_else(|| {
         Url::parse(&start_url)
@@ -334,6 +346,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut st = state.lock().await;
         st.enqueue(start_url.clone());
+    }
+    if let Some(resume_file) = &args.resume {
+        // load saved state
+        let data = fs::read_to_string(resume_file).await?;
+        let saved: SavedState = serde_json::from_str(&data)?;
+        // override args and state
+        args = saved.args.clone();
+        {
+            let mut st = state.lock().await;
+            st.queue = saved.queue;
+            st.in_progress = saved.in_progress;
+            st.completed = saved.completed;
+        }
+        {
+            let mut vis = visited.lock().await;
+            vis.clear();
+            let st = state.lock().await;
+            for u in st.queue.iter().chain(st.in_progress.iter()).chain(st.completed.iter()) {
+                vis.insert(u.clone());
+            }
+        }
     }
     // setup Ctrl+C flag
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -460,22 +493,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if let Some(path) = args.save_queue {
-        let st = state.lock().await;
-        let content = st
-            .queue
-            .iter()
-            .map(|u| {
-                u.strip_prefix("https://")
-                    .or_else(|| u.strip_prefix("http://"))
-                    .unwrap_or(u)
-            })
-            .collect::<Vec<&str>>()
-            .join("\n");
-        fs::write(path, content).await?;
+    if shutdown.load(Ordering::SeqCst) {
+        // auto-save or prompt
+        if let Some(path) = &args.save_queue {
+            save_state(&state, &args, path).await?;
+        } else {
+            println!("Save progress? (y/N): ");
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if input.trim().eq_ignore_ascii_case("y") {
+                println!("Enter file path to save state: ");
+                input.clear();
+                io::stdin().read_line(&mut input)?;
+                let path = input.trim();
+                save_state(&state, &args, path).await?;
+            }
+        }
     }
-    // ensure terminal is restored if still in raw mode
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+/// Save current state and args to JSON file
+async fn save_state(
+    state: &Arc<Mutex<AppState>>,
+    args: &Args,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let st = state.lock().await;
+    let saved = SavedState {
+        args: args.clone(),
+        queue: st.queue.clone(),
+        in_progress: st.in_progress.clone(),
+        completed: st.completed.clone(),
+    };
+    let content = serde_json::to_string_pretty(&saved)?;
+    fs::write(path, content).await?;
+    println!("State saved to {}", path);
     Ok(())
 }
