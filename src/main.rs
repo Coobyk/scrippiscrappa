@@ -18,7 +18,7 @@ use crossterm::{
 use reqwest::Client;
 use sanitize_filename::sanitize;
 use scraper::{Html, Selector};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::{
     fs,
@@ -45,7 +45,7 @@ struct Args {
     save_queue: Option<String>,
     #[clap(short, long, default_value_t = 8, help = "Parallel download count")]
     concurrency: usize,
-    #[clap(long, help = "Resume from saved state file")]
+    #[clap(short = 'r', long, help = "Resume from saved state file")]
     resume: Option<String>,
 }
 
@@ -363,7 +363,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut vis = visited.lock().await;
             vis.clear();
             let st = state.lock().await;
-            for u in st.queue.iter().chain(st.in_progress.iter()).chain(st.completed.iter()) {
+            for u in st
+                .queue
+                .iter()
+                .chain(st.in_progress.iter())
+                .chain(st.completed.iter())
+            {
                 vis.insert(u.clone());
             }
         }
@@ -387,7 +392,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
                         ..
-                    })) = event::read() {
+                    })) = event::read()
+                    {
                         shutdown.store(true, Ordering::SeqCst);
                         break;
                     }
