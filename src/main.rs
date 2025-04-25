@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, BTreeMap},
+    collections::{BTreeMap, HashSet},
     io,
     path::PathBuf,
     sync::{
@@ -233,28 +233,50 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         .split(f.size());
     // build and render queue as a tree
     #[derive(Default)]
-    struct Node { children: BTreeMap<String, Node> }
+    struct Node {
+        children: BTreeMap<String, Node>,
+    }
     let mut tree_map: BTreeMap<String, Node> = BTreeMap::new();
     for u in &st.queue {
         if let Ok(parsed) = Url::parse(u) {
             if let Some(host) = parsed.host_str() {
                 let mut node = tree_map.entry(host.to_string()).or_default();
-                for seg in parsed.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap_or_default().iter().filter(|s| !s.is_empty()) {
+                for seg in parsed
+                    .path_segments()
+                    .map(|c| c.collect::<Vec<_>>())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                {
                     node = node.children.entry(seg.to_string()).or_default();
                 }
             }
         }
     }
-    fn traverse(children: &BTreeMap<String, Node>, prefix: &str, is_last: bool, lines: &mut Vec<String>) {
+    fn traverse(
+        children: &BTreeMap<String, Node>,
+        prefix: &str,
+        is_last: bool,
+        lines: &mut Vec<String>,
+    ) {
         let keys: Vec<_> = children.keys().collect();
         for (i, key) in keys.iter().enumerate() {
             let last = i == keys.len() - 1;
             let mut line = prefix.to_string();
-            if is_last { line.push_str("    "); } else { line.push_str("│   "); }
+            if is_last {
+                line.push_str("    ");
+            } else {
+                line.push_str("│   ");
+            }
             line.push_str(if last { "└── " } else { "├── " });
             line.push_str(key);
             lines.push(line.clone());
-            traverse(&children[key.as_str()].children, &(prefix.to_string() + if is_last {"    "} else {"│   "}), last, lines);
+            traverse(
+                &children[key.as_str()].children,
+                &(prefix.to_string() + if is_last { "    " } else { "│   " }),
+                last,
+                lines,
+            );
         }
     }
     let mut lines_vec = Vec::new();
@@ -262,7 +284,12 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
     for (i, host) in hosts.iter().enumerate() {
         let last_host = i == hosts.len() - 1;
         lines_vec.push(host.to_string());
-        traverse(&tree_map[host.as_str()].children, "", last_host, &mut lines_vec);
+        traverse(
+            &tree_map[host.as_str()].children,
+            "",
+            last_host,
+            &mut lines_vec,
+        );
     }
     let queue_items: Vec<ListItem> = lines_vec.into_iter().map(ListItem::new).collect();
     let inprog_items: Vec<ListItem> = st
@@ -386,15 +413,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     st.start(url.clone());
                 }
                 if !shutdown_task.load(Ordering::SeqCst) {
-                    let _ = process_url(
-                        &client_clone,
-                        &url,
-                        &base,
-                        state_clone.clone(),
-                        visited_clone.clone(),
-                        &start_host,
-                    )
-                    .await;
+                    // Retry on transient failures up to 10 attempts
+                    let mut attempt = 0;
+                    const MAX_RETRIES: usize = 10;
+                    while attempt < MAX_RETRIES && !shutdown_task.load(Ordering::SeqCst) {
+                        match process_url(
+                            &client_clone,
+                            &url,
+                            &base,
+                            state_clone.clone(),
+                            visited_clone.clone(),
+                            &start_host,
+                        )
+                        .await
+                        {
+                            Ok(_) => break,
+                            Err(e) => {
+                                attempt += 1;
+                                if attempt >= MAX_RETRIES {
+                                    eprintln!(
+                                        "Failed processing {} after {} attempts: {}",
+                                        url, MAX_RETRIES, e
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Error processing {}: {}. Retrying {}/{}",
+                                        url, e, attempt, MAX_RETRIES
+                                    );
+                                    time::sleep(Duration::from_secs(2)).await;
+                                }
+                            }
+                        }
+                    }
                 }
                 {
                     let mut st = state_clone.lock().await;
