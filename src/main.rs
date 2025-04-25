@@ -1,10 +1,19 @@
-use std::{collections::HashSet, io, path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{
+    collections::HashSet,
+    io,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use clap::Parser;
 use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-    event::{self, Event, KeyEvent, KeyCode, KeyModifiers},
 };
 use reqwest::Client;
 use sanitize_filename::sanitize;
@@ -263,7 +272,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::task::spawn_blocking(move || {
             loop {
                 if event::poll(Duration::from_millis(200)).unwrap() {
-                    if let Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) = event::read().unwrap() {
+                    if let Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers: KeyModifiers::CONTROL,
+                        ..
+                    }) = event::read().unwrap()
+                    {
                         shutdown.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -328,7 +342,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state_clone.clone(),
                         visited_clone.clone(),
                         &start_host,
-                    ).await;
+                    )
+                    .await;
                 }
                 {
                     let mut st = state_clone.lock().await;
@@ -346,7 +361,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = args.save_queue {
         let st = state.lock().await;
-        let content = st.queue.join("\n");
+        let content = st
+            .queue
+            .iter()
+            .map(|u| u.strip_prefix("https://").unwrap_or(u))
+            .map(|u| u.strip_prefix("http://").unwrap_or(u))
+            .collect::<Vec<&str>>()
+            .join("\n");
         fs::write(path, content).await?;
     }
     // ensure terminal is restored if still in raw mode
