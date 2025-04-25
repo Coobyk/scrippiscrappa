@@ -437,7 +437,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             st.dequeue()
         };
         if let Some(url) = next {
-            eprintln!("Scraping {}", url);
+            if std::env::var("CI").is_ok() {
+                eprintln!("Scraping {}", url);
+            }
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let state_clone = state.clone();
             let visited_clone = visited.clone();
