@@ -395,33 +395,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    // setup TUI
-    let ui_state = state.clone();
-    let shutdown_ui = shutdown.clone();
-    let mut stdout = io::stdout();
-    enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    tokio::spawn(async move {
-        loop {
-            {
-                let st = ui_state.lock().await;
-                terminal.draw(|f| draw_ui(f, &st)).unwrap();
-                if st.queue.is_empty() && st.in_progress.is_empty() {
+    // setup TUI (skip in CI)
+    if std::env::var("CI").is_err() {
+        let ui_state = state.clone();
+        let shutdown_ui = shutdown.clone();
+        let mut stdout = io::stdout();
+        enable_raw_mode()?;
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+        tokio::spawn(async move {
+            loop {
+                {
+                    let st = ui_state.lock().await;
+                    terminal.draw(|f| draw_ui(f, &st)).unwrap();
+                    if st.queue.is_empty() && st.in_progress.is_empty() {
+                        break;
+                    }
+                }
+                if shutdown_ui.load(Ordering::SeqCst) {
                     break;
                 }
+                time::sleep(Duration::from_millis(200)).await;
             }
-            if shutdown_ui.load(Ordering::SeqCst) {
-                break;
-            }
-            time::sleep(Duration::from_millis(200)).await;
-        }
-        disable_raw_mode().unwrap();
-        let mut stdout = io::stdout();
-        execute!(stdout, LeaveAlternateScreen).unwrap();
-    });
-    let client = Client::builder().user_agent("scrippiscrappa").build()?;
+            disable_raw_mode().unwrap();
+            let mut stdout = io::stdout();
+            execute!(stdout, LeaveAlternateScreen).unwrap();
+        });
+    }
+    let client = Client::builder()
+        .user_agent("scrippiscrappa")
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -432,6 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             st.dequeue()
         };
         if let Some(url) = next {
+            eprintln!("Scraping {}", url);
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let state_clone = state.clone();
             let visited_clone = visited.clone();
@@ -488,7 +494,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             time::sleep(Duration::from_millis(100)).await;
             let st = state.lock().await;
             if st.queue.is_empty() && st.in_progress.is_empty() {
-                break;
+                eprintln!("All URLs processed. Exiting.");
+                std::process::exit(0);
             }
         }
     }
