@@ -42,6 +42,9 @@ jobs:
                       target/${{ matrix.target }}/release/scrippiscrappa
                       target/${{ matrix.target }}/release/scrippiscrappa.exe
 
+            - name: Clean up
+              run: rm target/${{ matrix.target }}/release/scrippiscrappa.d
+
             # Create GitHub release and attach built binaries
             - name: Create GitHub Release
               uses: softprops/action-gh-release@v1
