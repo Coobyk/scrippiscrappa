@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -30,7 +30,7 @@ use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use url::Url;
 
@@ -55,6 +55,7 @@ struct AppState {
     queue: Vec<String>,
     in_progress: Vec<String>,
     completed: Vec<String>,
+    start: Instant,
 }
 
 impl AppState {
@@ -63,6 +64,7 @@ impl AppState {
             queue: Vec::new(),
             in_progress: Vec::new(),
             completed: Vec::new(),
+            start: Instant::now(),
         }
     }
     fn enqueue(&mut self, url: String) {
@@ -324,7 +326,17 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         Spans::from(Span::raw(format!("In Progress ({})", st.in_progress.len()))),
     ));
     f.render_widget(queue_list, chunks[0]);
-    f.render_widget(inprog_list, chunks[1]);
+    // right column: in-progress list and rate counter
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
+        .split(chunks[1]);
+    f.render_widget(inprog_list, right_chunks[0]);
+    let elapsed = st.start.elapsed().as_secs_f64();
+    let rate = if elapsed > 0.0 { st.completed.len() as f64 / elapsed } else { 0.0 };
+    let rate_widget = Paragraph::new(Spans::from(Span::raw(format!("{:.2} sites/s", rate))))
+        .block(Block::default().borders(Borders::ALL).title(Span::raw("Rate")));
+    f.render_widget(rate_widget, right_chunks[1]);
 }
 
 #[tokio::main]
