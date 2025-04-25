@@ -17,6 +17,7 @@ use tui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
+    text::{Span, Spans},
     widgets::{Block, Borders, List, ListItem},
 };
 use url::Url;
@@ -107,7 +108,7 @@ async fn process_url(
     start_host: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let parsed = Url::parse(url)?;
-    let mut resp = client.get(url).send().await?;
+    let resp = client.get(url).send().await?;
     let headers = resp.headers().clone();
     let content = resp.bytes().await?;
     let local_path = get_local_path(&parsed, base);
@@ -125,19 +126,63 @@ async fn process_url(
                     let selectors = vec![
                         ("a", "href"),
                         ("img", "src"),
+                        ("img", "srcset"),
+                        ("source", "src"),
+                        ("source", "srcset"),
+                        ("video", "src"),
+                        ("video", "poster"),
+                        ("audio", "src"),
+                        ("track", "src"),
+                        ("embed", "src"),
+                        ("object", "data"),
+                        ("iframe", "src"),
                         ("script", "src"),
-                        ("link[rel=\"stylesheet\"]", "href"),
+                        ("link", "href"), // catch all link rel types
+                        ("meta[http-equiv=\"refresh\"]", "content"),
                     ];
                     let mut links = Vec::new();
                     for (sel_str, attr) in &selectors {
                         let selector = Selector::parse(sel_str).unwrap();
                         for element in document.select(&selector) {
-                            if let Some(link) = element.value().attr(attr) {
-                                if let Ok(link_url) = parsed.join(link) {
-                                    // Only enqueue if host matches start_host
-                                    if let Some(link_host) = link_url.host_str() {
-                                        if link_host == start_host {
-                                            links.push(link_url.as_str().to_string());
+                            if *attr == "srcset" {
+                                if let Some(srcset) = element.value().attr(attr) {
+                                    for src in srcset.split(',') {
+                                        let src =
+                                            src.trim().split_whitespace().next().unwrap_or("");
+                                        if !src.is_empty() {
+                                            if let Ok(link_url) = parsed.join(src) {
+                                                if let Some(link_host) = link_url.host_str() {
+                                                    if link_host == start_host {
+                                                        links.push(link_url.as_str().to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if *sel_str == "meta[http-equiv=\"refresh\"]"
+                                && *attr == "content"
+                            {
+                                // Parse meta refresh for URL
+                                if let Some(content) = element.value().attr(attr) {
+                                    if let Some(idx) = content.find("url=") {
+                                        let url_part = &content[idx + 4..];
+                                        if let Ok(link_url) = parsed.join(url_part) {
+                                            if let Some(link_host) = link_url.host_str() {
+                                                if link_host == start_host {
+                                                    links.push(link_url.as_str().to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(link) = element.value().attr(attr) {
+                                    if let Ok(link_url) = parsed.join(link) {
+                                        if let Some(link_host) = link_url.host_str() {
+                                            if link_host == start_host {
+                                                links.push(link_url.as_str().to_string());
+                                            }
                                         }
                                     }
                                 }
@@ -162,14 +207,7 @@ async fn process_url(
 fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
-            ]
-            .as_ref(),
-        )
+        .constraints([Constraint::Percentage(67), Constraint::Percentage(33)].as_ref())
         .split(f.size());
     let queue_items: Vec<ListItem> = st.queue.iter().map(|u| ListItem::new(u.clone())).collect();
     let inprog_items: Vec<ListItem> = st
@@ -177,20 +215,14 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         .iter()
         .map(|u| ListItem::new(u.clone()))
         .collect();
-    let comp_items: Vec<ListItem> = st
-        .completed
-        .iter()
-        .map(|u| ListItem::new(u.clone()))
-        .collect();
-    let queue_list =
-        List::new(queue_items).block(Block::default().borders(Borders::ALL).title("Queue"));
-    let inprog_list =
-        List::new(inprog_items).block(Block::default().borders(Borders::ALL).title("In Progress"));
-    let comp_list =
-        List::new(comp_items).block(Block::default().borders(Borders::ALL).title("Completed"));
+    let queue_list = List::new(queue_items).block(Block::default().borders(Borders::ALL).title(
+        Spans::from(Span::raw(format!("Queue ({})", st.queue.len()))),
+    ));
+    let inprog_list = List::new(inprog_items).block(Block::default().borders(Borders::ALL).title(
+        Spans::from(Span::raw(format!("In Progress ({})", st.in_progress.len()))),
+    ));
     f.render_widget(queue_list, chunks[0]);
     f.render_widget(inprog_list, chunks[1]);
-    f.render_widget(comp_list, chunks[2]);
 }
 
 #[tokio::main]
