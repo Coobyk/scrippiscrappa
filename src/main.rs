@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, BTreeMap},
     io,
     path::PathBuf,
     sync::{
@@ -219,17 +219,40 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(67), Constraint::Percentage(33)].as_ref())
         .split(f.size());
-    let queue_items: Vec<ListItem> = st
-        .queue
-        .iter()
-        .map(|u| {
-            let disp = u
-                .strip_prefix("https://")
-                .or_else(|| u.strip_prefix("http://"))
-                .unwrap_or(u);
-            ListItem::new(disp.to_string())
-        })
-        .collect();
+    // build and render queue as a tree
+    #[derive(Default)]
+    struct Node { children: BTreeMap<String, Node> }
+    let mut tree_map: BTreeMap<String, Node> = BTreeMap::new();
+    for u in &st.queue {
+        if let Ok(parsed) = Url::parse(u) {
+            if let Some(host) = parsed.host_str() {
+                let mut node = tree_map.entry(host.to_string()).or_default();
+                for seg in parsed.path_segments().map(|c| c.collect::<Vec<_>>()).unwrap_or_default().iter().filter(|s| !s.is_empty()) {
+                    node = node.children.entry(seg.to_string()).or_default();
+                }
+            }
+        }
+    }
+    fn traverse(children: &BTreeMap<String, Node>, prefix: &str, is_last: bool, lines: &mut Vec<String>) {
+        let keys: Vec<_> = children.keys().collect();
+        for (i, key) in keys.iter().enumerate() {
+            let last = i == keys.len() - 1;
+            let mut line = prefix.to_string();
+            if is_last { line.push_str("    "); } else { line.push_str("│   "); }
+            line.push_str(if last { "└── " } else { "├── " });
+            line.push_str(key);
+            lines.push(line.clone());
+            traverse(&children[key.as_str()].children, &(prefix.to_string() + if is_last {"    "} else {"│   "}), last, lines);
+        }
+    }
+    let mut lines_vec = Vec::new();
+    let hosts: Vec<_> = tree_map.keys().collect();
+    for (i, host) in hosts.iter().enumerate() {
+        let last_host = i == hosts.len() - 1;
+        lines_vec.push(host.to_string());
+        traverse(&tree_map[host.as_str()].children, "", last_host, &mut lines_vec);
+    }
+    let queue_items: Vec<ListItem> = lines_vec.into_iter().map(ListItem::new).collect();
     let inprog_items: Vec<ListItem> = st
         .in_progress
         .iter()
