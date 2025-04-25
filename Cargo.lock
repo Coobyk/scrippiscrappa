@@ -1638,6 +1638,8 @@ dependencies = [
  "reqwest",
  "sanitize-filename",
  "scraper",
+ "serde",
+ "serde_json",
  "tokio",
  "tui",
  "url",

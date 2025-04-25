@@ -13,3 +13,5 @@ futures = "0.3"
 tui = "0.19"
 crossterm = "0.26"
 sanitize-filename = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
