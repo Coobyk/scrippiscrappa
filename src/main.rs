@@ -436,6 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(10))
         .build()?;
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
+    let ci_mode = args.ci;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -475,7 +476,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await
                         {
-                            Ok(_) => break,
+                            Ok(_) => {
+                                if ci_mode {
+                                    eprintln!("Successfully saved {}", url);
+                                }
+                                break;
+                            }
                             Err(e) => {
                                 attempt += 1;
                                 if attempt >= MAX_RETRIES {
