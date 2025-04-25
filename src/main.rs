@@ -66,7 +66,19 @@ impl AppState {
         if self.queue.is_empty() {
             None
         } else {
-            Some(self.queue.remove(0))
+            // pick lexicographically smallest URL based on host/path
+            let min_idx = self
+                .queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, u)| {
+                    u.strip_prefix("https://")
+                        .or_else(|| u.strip_prefix("http://"))
+                        .unwrap_or(u)
+                })
+                .map(|(i, _)| i)
+                .unwrap();
+            Some(self.queue.remove(min_idx))
         }
     }
     fn start(&mut self, url: String) {
