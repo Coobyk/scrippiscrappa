@@ -40,3 +40,14 @@ jobs:
                   path: |
                       target/${{ matrix.target }}/release/scrippiscrappa
                       target/${{ matrix.target }}/release/scrippiscrappa.exe
+
+            # Create GitHub release and attach built binaries
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v1
+              with:
+                tag_name: v${{ github.run_number }}-{{ matrix.target }}
+                name: Release ${{ github.run_number }} ({{ matrix.target }})
+                files: |
+                  target/${{ matrix.target }}/release/scrippiscrappa*
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
