@@ -4,7 +4,8 @@ on:
         branches: [main]
     pull_request:
         branches: [main]
-
+permissions:
+    contents: write
 jobs:
     build:
         runs-on: ${{ matrix.os }}
@@ -45,9 +46,9 @@ jobs:
             - name: Create GitHub Release
               uses: softprops/action-gh-release@v1
               with:
-                tag_name: v${{ github.run_number }}-{{ matrix.target }}
-                name: Release ${{ github.run_number }} ({{ matrix.target }})
-                files: |
-                  target/${{ matrix.target }}/release/scrippiscrappa*
+                  tag_name: v${{ github.run_number }}-${{ matrix.target }}
+                  name: Release ${{ github.run_number }} (${{ matrix.target }})
+                  files: |
+                      target/${{ matrix.target }}/release/scrippiscrappa*
               env:
-                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
