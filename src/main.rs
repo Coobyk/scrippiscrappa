@@ -531,6 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // auto-save or prompt
         if let Some(path) = &args.save_queue {
             save_state(&state, &args, path).await?;
+            std::process::exit(0);
         } else {
             println!("Save progress? (y/N): ");
             let mut input = String::new();
@@ -541,6 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 io::stdin().read_line(&mut input)?;
                 let path = input.trim();
                 save_state(&state, &args, path).await?;
+                std::process::exit(0);
             }
         }
     }
