@@ -322,21 +322,23 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
     let queue_list = List::new(queue_items).block(Block::default().borders(Borders::ALL).title(
         Spans::from(Span::raw(format!("Queue ({})", st.queue.len()))),
     ));
-    let inprog_list = List::new(inprog_items).block(Block::default().borders(Borders::ALL).title(
-        Spans::from(Span::raw(format!("In Progress ({})", st.in_progress.len()))),
-    ));
     f.render_widget(queue_list, chunks[0]);
-    // right column: in-progress list and rate counter
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)].as_ref())
-        .split(chunks[1]);
-    f.render_widget(inprog_list, right_chunks[0]);
+    // calculate rate and include it in the In Progress title
     let elapsed = st.start.elapsed().as_secs_f64();
-    let rate = if elapsed > 0.0 { st.completed.len() as f64 / elapsed } else { 0.0 };
-    let rate_widget = Paragraph::new(Spans::from(Span::raw(format!("{:.2} sites/s", rate))))
-        .block(Block::default().borders(Borders::ALL).title(Span::raw("Rate")));
-    f.render_widget(rate_widget, right_chunks[1]);
+    let rate = if elapsed > 0.0 {
+        st.completed.len() as f64 / elapsed
+    } else {
+        0.0
+    };
+    let inprog_list = List::new(inprog_items).block(Block::default().borders(Borders::ALL).title(
+        Spans::from(Span::raw(format!(
+            "In Progress ({}) {:.2} sites/s",
+            st.in_progress.len(),
+            rate
+        ))),
+    ));
+    // render in-progress list in the right column
+    f.render_widget(inprog_list, chunks[1]);
 }
 
 #[tokio::main]
