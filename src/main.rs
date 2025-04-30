@@ -55,6 +55,12 @@ struct Args {
         help = "Force scraping of URLs with fragments (parts after #)"
     )]
     force_fragments: bool,
+    #[clap(
+        short = 'q',
+        long,
+        help = "Force scraping of URLs with query parameters (parts after ?)"
+    )]
+    force_queries: bool,
 }
 
 struct AppState {
@@ -151,10 +157,14 @@ async fn process_url(
     visited: Arc<Mutex<HashSet<String>>>,
     start_host: &str,
     force_fragments: bool,
+    force_queries: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut parsed = Url::parse(url)?;
     if !force_fragments {
         parsed.set_fragment(None);
+    }
+    if !force_queries {
+        parsed.set_query(None);
     }
     let resp = client.get(parsed.as_str()).send().await?;
     let headers = resp.headers().clone();
@@ -481,6 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start_host = start_host.clone();
             let shutdown_task = shutdown.clone();
             let force_fragments = args.force_fragments;
+            let force_queries = args.force_queries;
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
@@ -499,6 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             visited_clone.clone(),
                             &start_host,
                             force_fragments,
+                            force_queries,
                         )
                         .await
                         {
