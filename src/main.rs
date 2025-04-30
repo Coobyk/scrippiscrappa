@@ -60,8 +60,14 @@ struct Args {
         help = "Force scraping of URLs with query parameters (parts after ?)"
     )]
     force_queries: bool,
-    #[clap(short = 'i', long, help = "Ignore URLs containing this pattern")]
-    ignore: Option<String>,
+    #[clap(
+        short = 'i',
+        long,
+        help = "Ignore URLs containing these patterns (can be specified multiple times)",
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    ignore: Vec<String>,
 }
 
 struct AppState {
@@ -159,13 +165,11 @@ async fn process_url(
     start_host: &str,
     force_fragments: bool,
     force_queries: bool,
-    ignore_pattern: Option<&str>,
+    ignore_patterns: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Skip URLs containing the ignore pattern
-    if let Some(pattern) = ignore_pattern {
-        if url.contains(pattern) {
-            return Ok(());
-        }
+    // Skip URLs containing any of the ignore patterns
+    if ignore_patterns.iter().any(|pattern| url.contains(pattern)) {
+        return Ok(());
     }
     let mut parsed = Url::parse(url)?;
     if !force_fragments {
@@ -500,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let shutdown_task = shutdown.clone();
             let force_fragments = args.force_fragments;
             let force_queries = args.force_queries;
-            let ignore_pattern = args.ignore.clone();
+            let ignore_patterns = args.ignore.clone();
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
@@ -520,7 +524,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &start_host,
                             force_fragments,
                             force_queries,
-                            ignore_pattern.as_deref(),
+                            &ignore_patterns,
                         )
                         .await
                         {
