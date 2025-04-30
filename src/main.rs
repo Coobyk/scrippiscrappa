@@ -19,7 +19,6 @@ use reqwest::Client;
 use sanitize_filename::sanitize;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use tokio::{
     fs,
     sync::{Mutex, Semaphore},
@@ -30,7 +29,7 @@ use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem},
 };
 use url::Url;
 
@@ -61,6 +60,8 @@ struct Args {
         help = "Force scraping of URLs with query parameters (parts after ?)"
     )]
     force_queries: bool,
+    #[clap(short = 'i', long, help = "Ignore URLs containing this pattern")]
+    ignore: Option<String>,
 }
 
 struct AppState {
@@ -158,7 +159,14 @@ async fn process_url(
     start_host: &str,
     force_fragments: bool,
     force_queries: bool,
+    ignore_pattern: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Skip URLs containing the ignore pattern
+    if let Some(pattern) = ignore_pattern {
+        if url.contains(pattern) {
+            return Ok(());
+        }
+    }
     let mut parsed = Url::parse(url)?;
     if !force_fragments {
         parsed.set_fragment(None);
@@ -492,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let shutdown_task = shutdown.clone();
             let force_fragments = args.force_fragments;
             let force_queries = args.force_queries;
+            let ignore_pattern = args.ignore.as_deref();
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
@@ -511,6 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &start_host,
                             force_fragments,
                             force_queries,
+                            ignore_pattern,
                         )
                         .await
                         {
