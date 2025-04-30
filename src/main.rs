@@ -500,7 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let shutdown_task = shutdown.clone();
             let force_fragments = args.force_fragments;
             let force_queries = args.force_queries;
-            let ignore_pattern = args.ignore.as_deref();
+            let ignore_pattern = args.ignore.clone();
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
@@ -520,7 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &start_host,
                             force_fragments,
                             force_queries,
-                            ignore_pattern,
+                            ignore_pattern.as_deref(),
                         )
                         .await
                         {
