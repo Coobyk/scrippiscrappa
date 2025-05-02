@@ -68,6 +68,14 @@ struct Args {
         value_delimiter = ','
     )]
     ignore: Vec<String>,
+    #[clap(
+        short = 'd',
+        long,
+        help = "Allowed subdomains (comma-separated, e.g. 'blog,docs'). If not specified, only the main domain is allowed.",
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    subdomains: Vec<String>,
 }
 
 struct AppState {
@@ -166,6 +174,7 @@ async fn process_url(
     force_fragments: bool,
     force_queries: bool,
     ignore_patterns: &[String],
+    allowed_subdomains: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Skip URLs containing any of the ignore patterns
     if ignore_patterns.iter().any(|pattern| url.contains(pattern)) {
@@ -222,7 +231,11 @@ async fn process_url(
                                         if !src.is_empty() {
                                             if let Ok(link_url) = parsed.join(src) {
                                                 if let Some(link_host) = link_url.host_str() {
-                                                    if link_host == start_host {
+                                                    if is_allowed_host(
+                                                        link_host,
+                                                        start_host,
+                                                        allowed_subdomains,
+                                                    ) {
                                                         links.push(link_url.as_str().to_string());
                                                     }
                                                 }
@@ -239,7 +252,11 @@ async fn process_url(
                                         let url_part = &content[idx + 4..];
                                         if let Ok(link_url) = parsed.join(url_part) {
                                             if let Some(link_host) = link_url.host_str() {
-                                                if link_host == start_host {
+                                                if is_allowed_host(
+                                                    link_host,
+                                                    start_host,
+                                                    allowed_subdomains,
+                                                ) {
                                                     links.push(link_url.as_str().to_string());
                                                 }
                                             }
@@ -250,7 +267,11 @@ async fn process_url(
                                 if let Some(link) = element.value().attr(attr) {
                                     if let Ok(link_url) = parsed.join(link) {
                                         if let Some(link_host) = link_url.host_str() {
-                                            if link_host == start_host {
+                                            if is_allowed_host(
+                                                link_host,
+                                                start_host,
+                                                allowed_subdomains,
+                                            ) {
                                                 links.push(link_url.as_str().to_string());
                                             }
                                         }
@@ -272,6 +293,31 @@ async fn process_url(
         }
     }
     Ok(())
+}
+
+/// Check if a host is allowed based on the start host and allowed subdomains
+fn is_allowed_host(host: &str, start_host: &str, allowed_subdomains: &[String]) -> bool {
+    // If the host matches the start host exactly, it's allowed
+    if host == start_host {
+        return true;
+    }
+
+    // If no subdomains are allowed, only the main domain is allowed
+    if allowed_subdomains.is_empty() {
+        return false;
+    }
+
+    // Check if the host ends with the start host (i.e., is a subdomain)
+    if !host.ends_with(start_host) {
+        return false;
+    }
+
+    // Extract the subdomain part
+    let subdomain = host.strip_suffix(start_host).unwrap_or(host);
+    let subdomain = subdomain.strip_suffix('.').unwrap_or(subdomain);
+
+    // Check if the subdomain is in the allowed list
+    allowed_subdomains.iter().any(|s| s == subdomain)
 }
 
 fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
@@ -505,6 +551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let force_fragments = args.force_fragments;
             let force_queries = args.force_queries;
             let ignore_patterns = args.ignore.clone();
+            let allowed_subdomains = args.subdomains.clone();
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
@@ -525,6 +572,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             force_fragments,
                             force_queries,
                             &ignore_patterns,
+                            &allowed_subdomains,
                         )
                         .await
                         {
