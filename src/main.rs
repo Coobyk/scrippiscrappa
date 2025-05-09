@@ -525,7 +525,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let client = Client::builder()
         .user_agent("scrippiscrappa")
-        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()?;
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let ci_mode = args.ci;
