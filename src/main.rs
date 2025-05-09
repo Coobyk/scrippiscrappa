@@ -82,6 +82,7 @@ struct AppState {
     queue: Vec<String>,
     in_progress: Vec<String>,
     completed: Vec<String>,
+    completion_times: Vec<Instant>,
     start: Instant,
 }
 
@@ -91,6 +92,7 @@ impl AppState {
             queue: Vec::new(),
             in_progress: Vec::new(),
             completed: Vec::new(),
+            completion_times: Vec::new(),
             start: Instant::now(),
         }
     }
@@ -122,6 +124,7 @@ impl AppState {
     fn finish(&mut self, url: &String) {
         self.in_progress.retain(|u| u != url);
         self.completed.push(url.clone());
+        self.completion_times.push(Instant::now());
     }
 }
 
@@ -401,13 +404,15 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         Spans::from(Span::raw(format!("Queue ({})", st.queue.len()))),
     ));
     f.render_widget(queue_list, chunks[0]);
-    // calculate rate and include it in the In Progress title
-    let elapsed = st.start.elapsed().as_secs_f64();
-    let rate = if elapsed > 0.0 {
-        st.completed.len() as f64 / elapsed
-    } else {
-        0.0
-    };
+    // calculate rate based on last 10 seconds
+    let now = Instant::now();
+    let ten_seconds_ago = now - Duration::from_secs(10);
+    let recent_completions = st
+        .completion_times
+        .iter()
+        .filter(|&&t| t >= ten_seconds_ago)
+        .count();
+    let rate = recent_completions as f64 / 10.0;
     let inprog_list = List::new(inprog_items).block(Block::default().borders(Borders::ALL).title(
         Spans::from(Span::raw(format!(
             "In Progress ({}) {:.2} sites/s",
