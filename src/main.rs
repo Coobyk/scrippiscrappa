@@ -545,7 +545,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if let Some(url) = next {
             if std::env::var("CI").is_ok() {
-                eprintln!("Scraping {}", url);
+                let st = state.lock().await;
+                let total = st.queue.len() + st.in_progress.len() + st.completed.len();
+                eprintln!(
+                    "Scraping {} (Queue: {}, In Progress: {}, Completed: {}, Total: {})",
+                    url,
+                    st.queue.len(),
+                    st.in_progress.len(),
+                    st.completed.len(),
+                    total
+                );
             }
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let state_clone = state.clone();
