@@ -160,8 +160,19 @@ fn get_local_path(url: &Url, base: &str) -> PathBuf {
         if name.contains('.') {
             path.push(name);
         } else {
+            // Common document extensions
+            let doc_extensions = ["html", "htm", "xhtml", "xml", "php", "asp", "aspx", "jsp"];
+            let mut found = false;
+            for ext in doc_extensions {
+                if name.ends_with(ext) {
+                    found = true;
+                    break;
+                }
+            }
             path.push(name);
-            path.set_extension("html");
+            if !found {
+                path.set_extension("html");
+            }
         }
     }
     path
@@ -200,7 +211,13 @@ async fn process_url(
     fs::write(&local_path, &content).await?;
     if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
         if let Ok(ct_str) = ct.to_str() {
-            if ct_str.contains("text/html") {
+            // Check for various document types
+            if ct_str.contains("text/html")
+                || ct_str.contains("application/xhtml+xml")
+                || ct_str.contains("text/xml")
+                || ct_str.contains("application/xml")
+                || ct_str.contains("text/plain")
+            {
                 // collect links before locks to avoid holding non-Send refs
                 let to_enqueue = {
                     let html = String::from_utf8_lossy(&content).to_string();
@@ -532,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .user_agent("scrippiscrappa")
         .connect_timeout(Duration::from_secs(15))
         .pool_idle_timeout(Duration::from_secs(90))
+        .danger_accept_invalid_certs(true)
         .build()?;
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let ci_mode = args.ci;
