@@ -38,6 +38,12 @@ use url::Url;
 struct Args {
     #[clap(help = "Start URL to scrape")]
     url: String,
+    #[clap(
+        long,
+        help = "Comma-separated list of URLs to scrape in batch mode",
+        value_delimiter = ','
+    )]
+    batch: Option<Vec<String>>,
     #[clap(short, long, help = "Output directory name")]
     output: Option<String>,
     #[clap(short = 's', long, help = "Save remaining queue to file")]
@@ -79,7 +85,7 @@ struct Args {
 }
 
 struct AppState {
-    queue: Vec<String>,
+    queue: Vec<(String, String)>, // (url, base_folder)
     in_progress: Vec<String>,
     completed: Vec<String>,
     completion_times: Vec<Instant>,
@@ -96,10 +102,10 @@ impl AppState {
             start: Instant::now(),
         }
     }
-    fn enqueue(&mut self, url: String) {
-        self.queue.push(url);
+    fn enqueue(&mut self, url: String, base: String) {
+        self.queue.push((url, base));
     }
-    fn dequeue(&mut self) -> Option<String> {
+    fn dequeue(&mut self) -> Option<(String, String)> {
         if self.queue.is_empty() {
             None
         } else {
@@ -108,7 +114,7 @@ impl AppState {
                 .queue
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, u)| {
+                .min_by_key(|(_, (u, _))| {
                     u.strip_prefix("https://")
                         .or_else(|| u.strip_prefix("http://"))
                         .unwrap_or(u)
@@ -306,7 +312,7 @@ async fn process_url(
                 let mut st = state.lock().await;
                 for link in to_enqueue {
                     if vis.insert(link.clone()) {
-                        st.enqueue(link);
+                        st.enqueue(link, base.to_string());
                     }
                 }
             }
@@ -351,8 +357,8 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         children: BTreeMap<String, Node>,
     }
     let mut tree_map: BTreeMap<String, Node> = BTreeMap::new();
-    for u in &st.queue {
-        if let Ok(parsed) = Url::parse(u) {
+    for (url, base) in &st.queue {
+        if let Ok(parsed) = Url::parse(url) {
             if let Some(host) = parsed.host_str() {
                 let mut node = tree_map.entry(host.to_string()).or_default();
                 for seg in parsed
@@ -444,24 +450,43 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
-    let start_url = args.url.clone();
-    let output_folder = args.output.clone().unwrap_or_else(|| {
-        Url::parse(&start_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-            .unwrap_or("output".to_string())
-    });
-    fs::create_dir_all(&output_folder).await?;
+    // Determine starting URLs and their output folders
+    let start_urls: Vec<String> = if let Some(batch) = &args.batch {
+        batch.clone()
+    } else {
+        vec![args.url.clone()]
+    };
+    // Generate a base folder for each starting URL
+    let base_folders: Vec<String> = start_urls
+        .iter()
+        .map(|url| {
+            args.output.clone().unwrap_or_else(|| {
+                Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or("output".to_string())
+            })
+        })
+        .collect();
+    // Create all output folders
+    for base in &base_folders {
+        fs::create_dir_all(base).await?;
+    }
     let state = Arc::new(Mutex::new(AppState::new()));
     let visited = Arc::new(Mutex::new(HashSet::new()));
-    let start_host = Url::parse(&start_url)?.host_str().unwrap().to_string();
+    // Use the first URL's host as the start_host for filtering
+    let start_host = Url::parse(&start_urls[0])?.host_str().unwrap().to_string();
     {
         let mut vis = visited.lock().await;
-        vis.insert(start_url.clone());
+        for url in &start_urls {
+            vis.insert(url.clone());
+        }
     }
     {
         let mut st = state.lock().await;
-        st.enqueue(start_url.clone());
+        for (url, base) in start_urls.iter().zip(base_folders.iter()) {
+            st.enqueue(url.clone(), base.clone());
+        }
     }
     if let Some(resume_file) = &args.resume {
         // load saved state
@@ -471,20 +496,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args = saved.args.clone();
         {
             let mut st = state.lock().await;
-            st.queue = saved.queue;
-            st.in_progress = saved.in_progress;
-            st.completed = saved.completed;
+            // Recompute base folders for each URL in the saved queue
+            let base_folders: Vec<String> = saved
+                .queue
+                .iter()
+                .map(|url| {
+                    args.output.clone().unwrap_or_else(|| {
+                        Url::parse(url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_string()))
+                            .unwrap_or("output".to_string())
+                    })
+                })
+                .collect();
+            st.queue = saved
+                .queue
+                .iter()
+                .zip(base_folders.iter())
+                .map(|(u, b)| (u.clone(), b.clone()))
+                .collect();
+            st.in_progress = saved.in_progress.clone();
+            st.completed = saved.completed.clone();
         }
         {
             let mut vis = visited.lock().await;
             vis.clear();
             let st = state.lock().await;
-            for u in st
-                .queue
-                .iter()
-                .chain(st.in_progress.iter())
-                .chain(st.completed.iter())
-            {
+            for (u, _) in st.queue.iter() {
+                vis.insert(u.clone());
+            }
+            for u in st.in_progress.iter() {
+                vis.insert(u.clone());
+            }
+            for u in st.completed.iter() {
                 vis.insert(u.clone());
             }
         }
@@ -561,7 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut st = state.lock().await;
             st.dequeue()
         };
-        if let Some(url) = next {
+        if let Some((url, base)) = next {
             if std::env::var("CI").is_ok() {
                 let st = state.lock().await;
                 let total = st.queue.len() + st.in_progress.len() + st.completed.len();
@@ -578,7 +622,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let state_clone = state.clone();
             let visited_clone = visited.clone();
             let client_clone = client.clone();
-            let base = output_folder.clone();
+            let base = base.clone();
             let start_host = start_host.clone();
             let shutdown_task = shutdown.clone();
             let force_fragments = args.force_fragments;
@@ -679,7 +723,7 @@ async fn save_state(
     let st = state.lock().await;
     let saved = SavedState {
         args: args.clone(),
-        queue: st.queue.clone(),
+        queue: st.queue.iter().map(|(u, _)| u.clone()).collect(),
         in_progress: st.in_progress.clone(),
         completed: st.completed.clone(),
     };
