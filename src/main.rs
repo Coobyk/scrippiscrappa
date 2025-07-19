@@ -33,6 +33,10 @@ use tui::{
 };
 use url::Url;
 
+fn default_repetition_threshold() -> usize {
+    4
+}
+
 #[derive(Parser, Debug, Serialize, Deserialize, Clone)]
 #[clap(name = "scrippiscrappa", version)]
 struct Args {
@@ -83,6 +87,7 @@ struct Args {
     )]
     subdomains: Vec<String>,
     #[clap(long, default_value_t = 4, help = "Repetition threshold for path segments")]
+    #[serde(default = "default_repetition_threshold")]
     repetition_threshold: usize,
 }
 
