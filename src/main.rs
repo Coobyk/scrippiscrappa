@@ -96,7 +96,6 @@ struct AppState {
     in_progress: Vec<String>,
     completed: Vec<String>,
     completion_times: Vec<Instant>,
-    start: Instant,
 }
 
 impl AppState {
@@ -106,7 +105,6 @@ impl AppState {
             in_progress: Vec::new(),
             completed: Vec::new(),
             completion_times: Vec::new(),
-            start: Instant::now(),
         }
     }
     fn enqueue(&mut self, url: String, base: String) {
@@ -358,7 +356,7 @@ fn is_allowed_host(host: &str, start_host: &str, allowed_subdomains: &[String]) 
     allowed_subdomains.iter().any(|s| s == subdomain)
 }
 
-/// Check if a URL has repeated path segment sequences
+/// Check if a URL has repeated path segments
 fn has_repeated_segments(url: &str, threshold: usize) -> bool {
     if let Ok(parsed) = Url::parse(url) {
         if let Some(segments) = parsed.path_segments() {
@@ -366,24 +364,15 @@ fn has_repeated_segments(url: &str, threshold: usize) -> bool {
             if segments.is_empty() {
                 return false;
             }
-            // Check for repeating sequences of segments
-            for len in 1..=(segments.len() / 2) {
-                for i in 0..=(segments.len() - len * 2) {
-                    let pattern = &segments[i..i + len];
-                    let mut repetitions = 1;
-                    let mut next_pos = i + len;
-                    while next_pos + len <= segments.len() {
-                        let next_chunk = &segments[next_pos..next_pos + len];
-                        if pattern == next_chunk {
-                            repetitions += 1;
-                            next_pos += len;
-                        } else {
-                            break;
-                        }
-                    }
-                    if repetitions >= threshold {
-                        return true;
-                    }
+            // Count the occurrences of each path segment
+            let mut counts = BTreeMap::new();
+            for segment in segments {
+                *counts.entry(segment).or_insert(0) += 1;
+            }
+            // Check if any segment count exceeds the threshold
+            for &count in counts.values() {
+                if count >= threshold {
+                    return true;
                 }
             }
         }
@@ -402,7 +391,7 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         children: BTreeMap<String, Node>,
     }
     let mut tree_map: BTreeMap<String, Node> = BTreeMap::new();
-    for (url, base) in &st.queue {
+    for (url, _base) in &st.queue {
         if let Ok(parsed) = Url::parse(url) {
             if let Some(host) = parsed.host_str() {
                 let mut node = tree_map.entry(host.to_string()).or_default();
