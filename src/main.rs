@@ -82,6 +82,8 @@ struct Args {
         value_delimiter = ','
     )]
     subdomains: Vec<String>,
+    #[clap(long, default_value_t = 4, help = "Repetition threshold for path segments")]
+    repetition_threshold: usize,
 }
 
 struct AppState {
@@ -195,7 +197,12 @@ async fn process_url(
     force_queries: bool,
     ignore_patterns: &[String],
     allowed_subdomains: &[String],
+    repetition_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Skip URLs with repeated path segments
+    if has_repeated_segments(url, repetition_threshold) {
+        return Ok(());
+    }
     // Skip URLs containing any of the ignore patterns
     if ignore_patterns.iter().any(|pattern| url.contains(pattern)) {
         return Ok(());
@@ -344,6 +351,39 @@ fn is_allowed_host(host: &str, start_host: &str, allowed_subdomains: &[String]) 
 
     // Check if the subdomain is in the allowed list
     allowed_subdomains.iter().any(|s| s == subdomain)
+}
+
+/// Check if a URL has repeated path segment sequences
+fn has_repeated_segments(url: &str, threshold: usize) -> bool {
+    if let Ok(parsed) = Url::parse(url) {
+        if let Some(segments) = parsed.path_segments() {
+            let segments: Vec<_> = segments.collect();
+            if segments.is_empty() {
+                return false;
+            }
+            // Check for repeating sequences of segments
+            for len in 1..=(segments.len() / 2) {
+                for i in 0..=(segments.len() - len * 2) {
+                    let pattern = &segments[i..i + len];
+                    let mut repetitions = 1;
+                    let mut next_pos = i + len;
+                    while next_pos + len <= segments.len() {
+                        let next_chunk = &segments[next_pos..next_pos + len];
+                        if pattern == next_chunk {
+                            repetitions += 1;
+                            next_pos += len;
+                        } else {
+                            break;
+                        }
+                    }
+                    if repetitions >= threshold {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
@@ -629,6 +669,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let force_queries = args.force_queries;
             let ignore_patterns = args.ignore.clone();
             let allowed_subdomains = args.subdomains.clone();
+            let repetition_threshold = args.repetition_threshold;
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
@@ -650,6 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             force_queries,
                             &ignore_patterns,
                             &allowed_subdomains,
+                            repetition_threshold,
                         )
                         .await
                         {
