@@ -724,6 +724,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let st = state.lock().await;
             if st.queue.is_empty() && st.in_progress.is_empty() {
                 eprintln!("All URLs processed. Exiting.");
+                // Properly clean up terminal state before exiting
+                if !args.ci && std::env::var("CI").is_err() {
+                    // Disable raw mode and leave alternate screen
+                    disable_raw_mode().unwrap_or(());
+                    let mut stdout = io::stdout();
+                    execute!(stdout, LeaveAlternateScreen).unwrap_or(());
+                }
                 std::process::exit(0);
             }
         }
@@ -732,6 +739,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // auto-save or prompt
         if let Some(path) = &args.save_queue {
             save_state(&state, &args, path).await?;
+            // Properly clean up terminal state before exiting
+            if !args.ci && std::env::var("CI").is_err() {
+                disable_raw_mode().unwrap_or(());
+                let mut stdout = io::stdout();
+                execute!(stdout, LeaveAlternateScreen).unwrap_or(());
+            }
             std::process::exit(0);
         } else {
             println!("Save progress? (y/N): ");
@@ -743,7 +756,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 io::stdin().read_line(&mut input)?;
                 let path = input.trim();
                 save_state(&state, &args, path).await?;
+                // Properly clean up terminal state before exiting
+                if !args.ci && std::env::var("CI").is_err() {
+                    disable_raw_mode().unwrap_or(());
+                    let mut stdout = io::stdout();
+                    execute!(stdout, LeaveAlternateScreen).unwrap_or(());
+                }
                 std::process::exit(0);
+            } else {
+                // Clean up terminal even if user doesn't save
+                if !args.ci && std::env::var("CI").is_err() {
+                    disable_raw_mode().unwrap_or(());
+                    let mut stdout = io::stdout();
+                    execute!(stdout, LeaveAlternateScreen).unwrap_or(());
+                }
             }
         }
     }
