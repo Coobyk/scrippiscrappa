@@ -89,10 +89,19 @@ struct Args {
     #[clap(long, default_value_t = 4, help = "Repetition threshold for path segments")]
     #[serde(default = "default_repetition_threshold")]
     repetition_threshold: usize,
+    #[clap(
+        short = 'a',
+        long,
+        help = "Allowed alternative domains (comma-separated).",
+        num_args = 1..,
+        value_delimiter = ','
+    )]
+    alternative_domains: Vec<String>,
 }
 
 struct AppState {
     queue: Vec<(String, String)>, // (url, base_folder)
+    alternative_queue: Vec<(String, String)>, // (url, base_folder)
     in_progress: Vec<String>,
     completed: Vec<String>,
     completion_times: Vec<Instant>,
@@ -102,6 +111,7 @@ impl AppState {
     fn new() -> Self {
         Self {
             queue: Vec::new(),
+            alternative_queue: Vec::new(),
             in_progress: Vec::new(),
             completed: Vec::new(),
             completion_times: Vec::new(),
@@ -109,6 +119,9 @@ impl AppState {
     }
     fn enqueue(&mut self, url: String, base: String) {
         self.queue.push((url, base));
+    }
+    fn enqueue_alternative(&mut self, url: String, base: String) {
+        self.alternative_queue.push((url, base));
     }
     fn dequeue(&mut self) -> Option<(String, String)> {
         if self.queue.is_empty() {
@@ -129,6 +142,25 @@ impl AppState {
             Some(self.queue.remove(min_idx))
         }
     }
+    fn dequeue_alternative(&mut self) -> Option<(String, String)> {
+        if self.alternative_queue.is_empty() {
+            None
+        } else {
+            // pick lexicographically smallest URL based on host/path
+            let min_idx = self
+                .alternative_queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (u, _))| {
+                    u.strip_prefix("https://")
+                        .or_else(|| u.strip_prefix("http://"))
+                        .unwrap_or(u)
+                })
+                .map(|(i, _)| i)
+                .unwrap();
+            Some(self.alternative_queue.remove(min_idx))
+        }
+    }
     fn start(&mut self, url: String) {
         self.in_progress.push(url);
     }
@@ -143,6 +175,7 @@ impl AppState {
 struct SavedState {
     args: Args,
     queue: Vec<String>,
+    alternative_queue: Vec<String>,
     in_progress: Vec<String>,
     completed: Vec<String>,
 }
@@ -200,6 +233,7 @@ async fn process_url(
     force_queries: bool,
     ignore_patterns: &[String],
     allowed_subdomains: &[String],
+    alternative_domains: &[String],
     repetition_threshold: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Skip URLs with repeated path segments
@@ -234,6 +268,7 @@ async fn process_url(
                 || ct_str.contains("application/xml")
                 || ct_str.contains("text/plain")
             {
+                let mut vis = visited.lock().await;
                 // collect links before locks to avoid holding non-Send refs
                 let to_enqueue = {
                     let html = String::from_utf8_lossy(&content).to_string();
@@ -271,6 +306,7 @@ async fn process_url(
                                                         link_host,
                                                         start_host,
                                                         allowed_subdomains,
+                                                        alternative_domains,
                                                     ) {
                                                         links.push(link_url.as_str().to_string());
                                                     }
@@ -292,6 +328,7 @@ async fn process_url(
                                                     link_host,
                                                     start_host,
                                                     allowed_subdomains,
+                                                    alternative_domains,
                                                 ) {
                                                     links.push(link_url.as_str().to_string());
                                                 }
@@ -307,6 +344,7 @@ async fn process_url(
                                                 link_host,
                                                 start_host,
                                                 allowed_subdomains,
+                                                alternative_domains,
                                             ) {
                                                 links.push(link_url.as_str().to_string());
                                             }
@@ -318,11 +356,22 @@ async fn process_url(
                     }
                     links
                 };
-                let mut vis = visited.lock().await;
                 let mut st = state.lock().await;
                 for link in to_enqueue {
                     if vis.insert(link.clone()) {
-                        st.enqueue(link, base.to_string());
+                        if let Ok(link_url) = Url::parse(&link) {
+                            if let Some(link_host) = link_url.host_str() {
+                                if alternative_domains.iter().any(|d| d == link_host) {
+                                    st.enqueue_alternative(link, base.to_string());
+                                } else {
+                                    st.enqueue(link, base.to_string());
+                                }
+                            } else {
+                                st.enqueue(link, base.to_string());
+                            }
+                        } else {
+                            st.enqueue(link, base.to_string());
+                        }
                     }
                 }
             }
@@ -332,9 +381,14 @@ async fn process_url(
 }
 
 /// Check if a host is allowed based on the start host and allowed subdomains
-fn is_allowed_host(host: &str, start_host: &str, allowed_subdomains: &[String]) -> bool {
+fn is_allowed_host(host: &str, start_host: &str, allowed_subdomains: &[String], alternative_domains: &[String]) -> bool {
     // If the host matches the start host exactly, it's allowed
     if host == start_host {
+        return true;
+    }
+
+    // Check if the host is in the list of alternative domains
+    if alternative_domains.iter().any(|d| d == host) {
         return true;
     }
 
@@ -382,9 +436,15 @@ fn has_repeated_segments(url: &str, threshold: usize) -> bool {
 
 fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
     let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(80), Constraint::Percentage(20)].as_ref())
+        .split(f.size());
+
+    let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(67), Constraint::Percentage(33)].as_ref())
-        .split(f.size());
+        .split(chunks[0]);
+
     // build and render queue as a tree
     #[derive(Default)]
     struct Node {
@@ -460,7 +520,7 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
     let queue_list = List::new(queue_items).block(Block::default().borders(Borders::ALL).title(
         Spans::from(Span::raw(format!("Queue ({})", st.queue.len()))),
     ));
-    f.render_widget(queue_list, chunks[0]);
+    f.render_widget(queue_list, top_chunks[0]);
     // calculate rate based on last 10 seconds
     let now = Instant::now();
     let ten_seconds_ago = now - Duration::from_secs(10);
@@ -478,7 +538,44 @@ fn draw_ui<B: tui::backend::Backend>(f: &mut tui::Frame<B>, st: &AppState) {
         ))),
     ));
     // render in-progress list in the right column
-    f.render_widget(inprog_list, chunks[1]);
+    f.render_widget(inprog_list, top_chunks[1]);
+
+    let mut alt_tree_map: BTreeMap<String, Node> = BTreeMap::new();
+    for (url, _base) in &st.alternative_queue {
+        if let Ok(parsed) = Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                let mut node = alt_tree_map.entry(host.to_string()).or_default();
+                for seg in parsed
+                    .path_segments()
+                    .map(|c| c.collect::<Vec<_>>())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                {
+                    node = node.children.entry(seg.to_string()).or_default();
+                }
+            }
+        }
+    }
+
+    let mut alt_lines_vec = Vec::new();
+    let alt_hosts: Vec<_> = alt_tree_map.keys().collect();
+    for (i, host) in alt_hosts.iter().enumerate() {
+        let last_host = i == alt_hosts.len() - 1;
+        alt_lines_vec.push(host.to_string());
+        traverse(
+            &alt_tree_map[host.as_str()].children,
+            "",
+            last_host,
+            &mut alt_lines_vec,
+        );
+    }
+
+    let alt_queue_items: Vec<ListItem> = alt_lines_vec.into_iter().map(ListItem::new).collect();
+    let alt_queue_list = List::new(alt_queue_items).block(Block::default().borders(Borders::ALL).title(
+        Spans::from(Span::raw(format!("Alternative Queue ({})", st.alternative_queue.len()))),
+    ));
+    f.render_widget(alt_queue_list, chunks[1]);
 }
 
 #[tokio::main]
@@ -545,6 +642,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             st.queue = saved
                 .queue
+                .iter()
+                .zip(base_folders.iter())
+                .map(|(u, b)| (u.clone(), b.clone()))
+                .collect();
+            st.alternative_queue = saved
+                .alternative_queue
                 .iter()
                 .zip(base_folders.iter())
                 .map(|(u, b)| (u.clone(), b.clone()))
@@ -631,13 +734,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let ci_mode = args.ci;
+    let mut processing_alternative_queue = false;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         let next = {
             let mut st = state.lock().await;
-            st.dequeue()
+            if !processing_alternative_queue {
+                if st.queue.is_empty() {
+                    processing_alternative_queue = true;
+                    st.dequeue_alternative()
+                } else {
+                    st.dequeue()
+                }
+            } else {
+                st.dequeue_alternative()
+            }
         };
         if let Some((url, base)) = next {
             if std::env::var("CI").is_ok() {
@@ -663,6 +776,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let force_queries = args.force_queries;
             let ignore_patterns = args.ignore.clone();
             let allowed_subdomains = args.subdomains.clone();
+            let alternative_domains = args.alternative_domains.clone();
             let repetition_threshold = args.repetition_threshold;
             tokio::spawn(async move {
                 {
@@ -685,6 +799,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             force_queries,
                             &ignore_patterns,
                             &allowed_subdomains,
+                            &alternative_domains,
                             repetition_threshold,
                         )
                         .await
@@ -786,6 +901,7 @@ async fn save_state(
     let saved = SavedState {
         args: args.clone(),
         queue: st.queue.iter().map(|(u, _)| u.clone()).collect(),
+        alternative_queue: st.alternative_queue.iter().map(|(u, _)| u.clone()).collect(),
         in_progress: st.in_progress.clone(),
         completed: st.completed.clone(),
     };
