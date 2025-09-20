@@ -21,7 +21,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    sync::{Mutex, Semaphore},
+    sync::{mpsc, Mutex, Semaphore},
     time,
 };
 use tui::{
@@ -605,6 +605,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let state = Arc::new(Mutex::new(AppState::new()));
     let visited = Arc::new(Mutex::new(HashSet::new()));
+    let (tx, mut rx) = mpsc::channel(100);
     // Use the first URL's host as the start_host for filtering
     let start_host = Url::parse(&start_urls[0])?.host_str().unwrap().to_string();
     {
@@ -712,7 +713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let st = ui_state.lock().await;
                     terminal.draw(|f| draw_ui(f, &st)).unwrap();
-                    if st.queue.is_empty() && st.in_progress.is_empty() {
+                    if st.queue.is_empty() && st.alternative_queue.is_empty() && st.in_progress.is_empty() {
                         break;
                     }
                 }
@@ -778,10 +779,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let allowed_subdomains = args.subdomains.clone();
             let alternative_domains = args.alternative_domains.clone();
             let repetition_threshold = args.repetition_threshold;
+            let url_clone = url.clone();
+            let tx_clone = tx.clone();
             tokio::spawn(async move {
                 {
                     let mut st = state_clone.lock().await;
-                    st.start(url.clone());
+                    st.start(url_clone.clone());
                 }
                 if !shutdown_task.load(Ordering::SeqCst) {
                     // Retry on transient failures up to 10 attempts
@@ -790,7 +793,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     while attempt < MAX_RETRIES && !shutdown_task.load(Ordering::SeqCst) {
                         match process_url(
                             &client_clone,
-                            &url,
+                            &url_clone,
                             &base,
                             state_clone.clone(),
                             visited_clone.clone(),
@@ -806,7 +809,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             Ok(_) => {
                                 if ci_mode {
-                                    eprintln!("Successfully saved {}", url);
+                                    eprintln!("Successfully saved {}", url_clone);
                                 }
                                 break;
                             }
@@ -815,12 +818,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if attempt >= MAX_RETRIES {
                                     eprintln!(
                                         "Failed processing {} after {} attempts: {}",
-                                        url, MAX_RETRIES, e
+                                        url_clone, MAX_RETRIES, e
                                     );
                                 } else {
                                     eprintln!(
                                         "Error processing {}: {}. Retrying {}/{}",
-                                        url, e, attempt, MAX_RETRIES
+                                        url_clone, e, attempt, MAX_RETRIES
                                     );
                                     time::sleep(Duration::from_secs(2)).await;
                                 }
@@ -830,24 +833,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 {
                     let mut st = state_clone.lock().await;
-                    st.finish(&url);
+                    st.finish(&url_clone);
                 }
+                let _ = tx_clone.send(()).await;
                 drop(permit);
             });
         } else {
-            time::sleep(Duration::from_millis(100)).await;
-            let st = state.lock().await;
-            if st.queue.is_empty() && st.in_progress.is_empty() {
-                eprintln!("All URLs processed. Exiting.");
-                // Properly clean up terminal state before exiting
-                if !args.ci && std::env::var("CI").is_err() {
-                    // Disable raw mode and leave alternate screen
-                    disable_raw_mode().unwrap_or(());
-                    let mut stdout = io::stdout();
-                    execute!(stdout, LeaveAlternateScreen).unwrap_or(());
+            if let Ok(_) = rx.try_recv() {
+                // Task finished
+            } else {
+                let st = state.lock().await;
+                if st.queue.is_empty() && st.alternative_queue.is_empty() && st.in_progress.is_empty() {
+                    eprintln!("All URLs processed. Exiting.");
+                    // Properly clean up terminal state before exiting
+                    if !args.ci && std::env::var("CI").is_err() {
+                        // Disable raw mode and leave alternate screen
+                        disable_raw_mode().unwrap_or(());
+                        let mut stdout = io::stdout();
+                        execute!(stdout, LeaveAlternateScreen).unwrap_or(());
+                    }
+                    std::process::exit(0);
                 }
-                std::process::exit(0);
             }
+            time::sleep(Duration::from_millis(100)).await;
         }
     }
     if shutdown.load(Ordering::SeqCst) {
