@@ -162,9 +162,11 @@ impl AppState {
         }
     }
     fn start(&mut self, url: String) {
+        eprintln!("Debug: Marking URL as in progress: {}", url);
         self.in_progress.push(url);
     }
     fn finish(&mut self, url: &String) {
+        eprintln!("Debug: Marking URL as finished: {}", url);
         self.in_progress.retain(|u| u != url);
         self.completed.push(url.clone());
         self.completion_times.push(Instant::now());
@@ -357,20 +359,29 @@ async fn process_url(
                     links
                 };
                 let mut st = state.lock().await;
+                eprintln!("Debug: Found {} links to enqueue", to_enqueue.len());
+                for link in &to_enqueue {
+                    eprintln!("Debug: Enqueueing link: {}", link);
+                }
                 for link in to_enqueue {
                     if vis.insert(link.clone()) {
+                        eprintln!("Debug: Actually enqueuing unique link: {}", link);
                         if let Ok(link_url) = Url::parse(&link) {
                             if let Some(link_host) = link_url.host_str() {
                                 if alternative_domains.iter().any(|d| d == link_host) {
                                     st.enqueue_alternative(link, base.to_string());
+                                    eprintln!("Debug: Enqueued to alternative queue");
                                 } else {
                                     st.enqueue(link, base.to_string());
+                                    eprintln!("Debug: Enqueued to main queue");
                                 }
                             } else {
                                 st.enqueue(link, base.to_string());
+                                eprintln!("Debug: Enqueued to main queue (no host)");
                             }
                         } else {
                             st.enqueue(link, base.to_string());
+                            eprintln!("Debug: Enqueued to main queue (invalid URL)");
                         }
                     }
                 }
@@ -742,15 +753,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let next = {
             let mut st = state.lock().await;
+            eprintln!("Debug: Loop - queue={}, alternative_queue={}, in_progress={}", 
+                      st.queue.len(), st.alternative_queue.len(), st.in_progress.len());
             if !processing_alternative_queue {
                 if st.queue.is_empty() {
-                    processing_alternative_queue = true;
-                    st.dequeue_alternative()
+                    // Only switch to alternative queue if there are no tasks in progress
+                    if st.in_progress.is_empty() {
+                        processing_alternative_queue = true;
+                        eprintln!("Debug: Switching to alternative queue");
+                        st.dequeue_alternative()
+                    } else {
+                        // Wait for tasks to finish before switching queues
+                        eprintln!("Debug: Waiting for tasks to finish before switching to alternative queue");
+                        None
+                    }
                 } else {
-                    st.dequeue()
+                    let result = st.dequeue();
+                    eprintln!("Debug: Dequeued from main queue: {:?}", result.as_ref().map(|(url, _)| url));
+                    result
                 }
             } else {
-                st.dequeue_alternative()
+                let result = st.dequeue_alternative();
+                eprintln!("Debug: Dequeued from alternative queue: {:?}", result.as_ref().map(|(url, _)| url));
+                result
             }
         };
         if let Some((url, base)) = next {
@@ -782,9 +807,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let url_clone = url.clone();
             let tx_clone = tx.clone();
             tokio::spawn(async move {
+                eprintln!("Debug: Task started for URL: {}", url_clone);
                 {
                     let mut st = state_clone.lock().await;
                     st.start(url_clone.clone());
+                    eprintln!("Debug: Marked URL as in progress: {}", url_clone);
                 }
                 if !shutdown_task.load(Ordering::SeqCst) {
                     // Retry on transient failures up to 10 attempts
@@ -838,11 +865,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = tx_clone.send(()).await;
                 drop(permit);
             });
+            // Give the spawned task a chance to run
+            time::sleep(Duration::from_millis(10)).await;
         } else {
             if let Ok(_) = rx.try_recv() {
-                // Task finished
+                // Task finished, continue with the loop to process next URL
+                eprintln!("Debug: Task finished, continuing loop");
             } else {
                 let st = state.lock().await;
+                eprintln!("Debug: queue={}, alternative_queue={}, in_progress={}", 
+                          st.queue.len(), st.alternative_queue.len(), st.in_progress.len());
                 if st.queue.is_empty() && st.alternative_queue.is_empty() && st.in_progress.is_empty() {
                     eprintln!("All URLs processed. Exiting.");
                     // Properly clean up terminal state before exiting
