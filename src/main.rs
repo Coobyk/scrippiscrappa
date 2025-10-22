@@ -278,6 +278,7 @@ async fn process_url(
                         ("embed", "src"),
                         ("object", "data"),
                         ("iframe", "src"),
+                        ("frame", "src"),
                         ("script", "src"),
                         ("link", "href"), // catch all link rel types
                         ("meta[http-equiv=\"refresh\"]", "content"),
