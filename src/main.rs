@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -15,8 +15,63 @@ const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
+const PURPLE: &str = "\x1b[35m";
+const ORANGE: &str = "\x1b[38;5;208m";
+const BLUE: &str = "\x1b[34m";
+const WHITE: &str = "\x1b[37m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
+
+#[derive(Clone, Copy)]
+enum UrlType {
+    Html,
+    Css,
+    Script,
+    Image,
+    Audio,
+    Other,
+}
+
+impl UrlType {
+    fn color(self) -> &'static str {
+        match self {
+            UrlType::Html => WHITE,
+            UrlType::Css => PURPLE,
+            UrlType::Script => YELLOW,
+            UrlType::Image => ORANGE,
+            UrlType::Audio => BLUE,
+            UrlType::Other => CYAN,
+        }
+    }
+}
+
+fn classify_url(content_type: &str, url: &str) -> UrlType {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("javascript") || ct.contains("typescript") || ct.contains("ecmascript") || ct.contains("wasm") {
+        return UrlType::Script;
+    }
+    if ct.contains("text/html") { return UrlType::Html; }
+    if ct.contains("text/css") || ct.contains("css") { return UrlType::Css; }
+    if ct.contains("image/") { return UrlType::Image; }
+    if ct.contains("audio/") { return UrlType::Audio; }
+
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".ts") || path.ends_with(".wasm") {
+        return UrlType::Script;
+    }
+    if path.ends_with(".html") || path.ends_with(".htm") { return UrlType::Html; }
+    if path.ends_with(".css") { return UrlType::Css; }
+    if path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg")
+        || path.ends_with(".gif") || path.ends_with(".svg") || path.ends_with(".webp")
+        || path.ends_with(".ico") || path.ends_with(".avif") {
+        return UrlType::Image;
+    }
+    if path.ends_with(".mp3") || path.ends_with(".wav") || path.ends_with(".ogg")
+        || path.ends_with(".flac") || path.ends_with(".aac") || path.ends_with(".m4a") {
+        return UrlType::Audio;
+    }
+    UrlType::Other
+}
 
 struct DownloadResult {
     url: String,
@@ -25,6 +80,7 @@ struct DownloadResult {
     elapsed: f64,
     success: bool,
     error: Option<String>,
+    url_type: UrlType,
 }
 
 #[derive(Parser, Debug)]
@@ -37,6 +93,8 @@ struct Args {
     depth: usize,
     #[arg(short = 'o', default_value = ".")]
     output: PathBuf,
+    #[arg(long = "no-limits")]
+    no_limits: bool,
 }
 
 struct CrawlState {
@@ -44,12 +102,14 @@ struct CrawlState {
     stats: Stats,
     active_tasks: AtomicUsize,
     queued: AtomicUsize,
+    speed_log: StdMutex<VecDeque<(Instant, u64)>>,
 }
 
 struct Stats {
     downloaded: AtomicU64,
     failed: AtomicU64,
     bytes: AtomicU64,
+    skipped: AtomicU64,
 }
 
 impl Stats {
@@ -58,6 +118,7 @@ impl Stats {
             downloaded: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
         }
     }
 }
@@ -177,14 +238,15 @@ async fn save_file(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn print_result_line(r: &DownloadResult) {
+    let c = r.url_type.color();
     if r.success {
         eprintln!("  {}↓{} {}{}{}  {}{:.2}s  {}  {}{}",
-            GREEN, RESET, CYAN, r.url, RESET,
+            GREEN, RESET, c, r.url, RESET,
             DIM, r.elapsed, fmt_speed(r.speed), fmt_size(r.size), RESET);
     } else {
         let err = r.error.as_deref().unwrap_or("unknown");
         eprintln!("  {}✗{} {}{}{}  {}{}{}",
-            RED, RESET, CYAN, r.url, RESET, RED, err, RESET);
+            RED, RESET, c, r.url, RESET, RED, err, RESET);
     }
 }
 
@@ -193,10 +255,24 @@ fn print_progress(state: &CrawlState, start: Instant) {
     let q = state.queued.load(Ordering::Relaxed);
     let a = state.active_tasks.load(Ordering::Relaxed);
     let f = state.stats.failed.load(Ordering::Relaxed);
+    let sk = state.stats.skipped.load(Ordering::Relaxed);
     let b = state.stats.bytes.load(Ordering::Relaxed);
     let e = start.elapsed().as_secs_f64();
     let sp = if e > 0.0 { dl as f64 / e } else { 0.0 };
     let mb = b as f64 / 1048576.0;
+
+    let dl_speed = {
+        let mut log = state.speed_log.lock().unwrap();
+        let now = Instant::now();
+        while log.front().map_or(false, |(t, _)| now.duration_since(*t).as_secs_f64() > 10.0) {
+            log.pop_front();
+        }
+        if log.len() >= 2 {
+            let total: u64 = log.iter().map(|(_, b)| b).sum();
+            let span = now.duration_since(log.front().unwrap().0).as_secs_f64();
+            if span > 0.0 { total as f64 / span } else { 0.0 }
+        } else { 0.0 }
+    };
 
     eprint!("\r\x1b[K  ");
     eprint!("{}dl: {}{}{} | ", GREEN, BOLD, dl, RESET);
@@ -205,12 +281,33 @@ fn print_progress(state: &CrawlState, start: Instant) {
     else { eprint!("a: 0 | "); }
     if f > 0 { eprint!("{}f: {}{}{} | ", RED, BOLD, f, RESET); }
     else { eprint!("f: 0 | "); }
+    if sk > 0 { eprint!("{}s: {}{}{} | ", DIM, BOLD, sk, RESET); }
     eprint!("{:.1} MB | ", mb);
     eprint!("{}{:.0} f/s{} | ", DIM, sp, RESET);
+    eprint!("{} | ", fmt_speed(dl_speed));
     eprint!("{:.0}s", e);
 }
 
-fn enqueue(url: String, depth: usize, max: usize, state: &CrawlState, tx: &mpsc::UnboundedSender<(String, usize)>) {
+fn is_sane_url(url: &str, no_limits: bool) -> bool {
+    if no_limits { return true; }
+    if url.len() > 2048 { return false; }
+    if let Ok(parsed) = url::Url::parse(url) {
+        let segments: Vec<&str> = parsed.path_segments()
+            .map(|s| s.filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        if segments.len() > 32 { return false; }
+        for i in 1..segments.len() {
+            if segments[i] == segments[i - 1] { return false; }
+        }
+    }
+    true
+}
+
+fn enqueue(url: String, depth: usize, max: usize, state: &CrawlState, tx: &mpsc::UnboundedSender<(String, usize)>, no_limits: bool) {
+    if !is_sane_url(&url, no_limits) {
+        state.stats.skipped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     if max == 0 || depth <= max {
         state.queued.fetch_add(1, Ordering::Relaxed);
         let _ = tx.send((url, depth));
@@ -245,6 +342,7 @@ async fn main() -> Result<()> {
         stats: Stats::new(),
         active_tasks: AtomicUsize::new(0),
         queued: AtomicUsize::new(0),
+        speed_log: StdMutex::new(VecDeque::new()),
     });
 
     let sem = Arc::new(Semaphore::new(args.connections));
@@ -262,9 +360,9 @@ async fn main() -> Result<()> {
             Ok((url, depth)) => {
                 let permit = sem.clone().acquire_owned().await?;
                 state.active_tasks.fetch_add(1, Ordering::Relaxed);
-                let (c, o, d, s, tx, rtx, md) = (
+                let (c, o, d, s, tx, rtx, md, nl) = (
                     client.clone(), out_dir.clone(), domain.clone(),
-                    state.clone(), tx.clone(), rtx.clone(), args.depth,
+                    state.clone(), tx.clone(), rtx.clone(), args.depth, args.no_limits,
                 );
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -278,18 +376,24 @@ async fn main() -> Result<()> {
                             let same = parsed.as_ref().and_then(|u| u.host_str()).map(|h| h == d).unwrap_or(false);
                             let fp = parsed.as_ref().map(url_to_filepath).unwrap_or_else(|| PathBuf::from("unknown"));
                             if let Err(e) = save_file(&o.join(&fp), &body).await {
-                                let _ = rtx.send(DownloadResult { url: url.clone(), size: sz, speed: spd, elapsed: el, success: false, error: Some(format!("{}", e)) });
+                                let _ = rtx.send(DownloadResult { url: url.clone(), size: sz, speed: spd, elapsed: el, success: false, error: Some(format!("{}", e)), url_type: classify_url(&ct, &url) });
                                 s.stats.failed.fetch_add(1, Ordering::Relaxed);
                             } else {
-                                let _ = rtx.send(DownloadResult { url: url.clone(), size: sz, speed: spd, elapsed: el, success: true, error: None });
+                                let ut = classify_url(&ct, &url);
+                                {
+                                    let mut log = s.speed_log.lock().unwrap();
+                                    log.push_back((Instant::now(), sz as u64));
+                                }
+                                let _ = rtx.send(DownloadResult { url: url.clone(), size: sz, speed: spd, elapsed: el, success: true, error: None, url_type: ut });
                                 s.stats.downloaded.fetch_add(1, Ordering::Relaxed);
                                 s.stats.bytes.fetch_add(sz as u64, Ordering::Relaxed);
                             }
                             if same && ct.contains("text/html") {
                                 if let (Ok(h), Some(p)) = (std::str::from_utf8(&body), parsed.as_ref()) {
                                     for link in extract_links(h, p, &d) {
+                                        if !is_sane_url(&link, nl) { continue; }
                                         let mut v = s.visited.lock().await;
-                                        if v.insert(link.clone()) { drop(v); enqueue(link, depth+1, md, &s, &tx); }
+                                        if v.insert(link.clone()) { drop(v); enqueue(link, depth+1, md, &s, &tx, nl); }
                                     }
                                 }
                             }
@@ -299,8 +403,9 @@ async fn main() -> Result<()> {
                                         if let Some(r) = resolve_url(p, &href) {
                                             if r.host_str() == Some(d.as_str()) {
                                                 let rs = r.to_string();
+                                                if !is_sane_url(&rs, nl) { continue; }
                                                 let mut v = s.visited.lock().await;
-                                                if v.insert(rs.clone()) { drop(v); enqueue(rs, depth+1, md, &s, &tx); }
+                                                if v.insert(rs.clone()) { drop(v); enqueue(rs, depth+1, md, &s, &tx, nl); }
                                             }
                                         }
                                     }
@@ -309,7 +414,7 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             let el = t1.elapsed().as_secs_f64();
-                            let _ = rtx.send(DownloadResult { url: url.clone(), size: 0, speed: 0.0, elapsed: el, success: false, error: Some(format!("{:#}", e)) });
+                            let _ = rtx.send(DownloadResult { url: url.clone(), size: 0, speed: 0.0, elapsed: el, success: false, error: Some(format!("{:#}", e)), url_type: classify_url("", &url) });
                             s.stats.failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -342,6 +447,8 @@ async fn main() -> Result<()> {
     eprintln!("{}done{} in {}{:.1}s{}", BOLD, RESET, DIM, el.as_secs_f64(), RESET);
     eprintln!("  {}{}{} downloaded", GREEN, dl, RESET);
     if fl > 0 { eprintln!("  {}{}{} failed", RED, fl, RESET); }
+    let sk = state.stats.skipped.load(Ordering::Relaxed);
+    if sk > 0 { eprintln!("  {}{}{} skipped (loop/bad url)", DIM, sk, RESET); }
     eprintln!("  {}{:.2} MB{} total", BOLD, bt as f64 / 1048576.0, RESET);
 
     Ok(())
