@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls-native-roots"], default-features = false }
 tokio = { version = "1", features = ["full"] }
 scraper = "0.21"
 url = "2"

@@ -396,10 +396,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("\n  failed: {} — {}", url, e);
-                    state.stats.failed.fetch_add(1, Ordering::Relaxed);
-                }
+                        Err(e) => {
+                            eprintln!("\n  failed: {} — {:#}", url, e);
+                            state.stats.failed.fetch_add(1, Ordering::Relaxed);
+                        }
             }
 
             state.queued.fetch_sub(1, Ordering::Relaxed);
