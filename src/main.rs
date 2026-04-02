@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -10,21 +10,31 @@ use scraper::{Html, Selector};
 use tokio::fs;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-#[derive(Parser, Debug)]
-#[command(name = "scrippiscrappa", version, about = "A fast, concurrent website scraper. Downloads everything.")]
-struct Args {
-    /// URL to scrape (scheme auto-prepended if missing)
-    url: String,
+const BOLD: &str = "\x1b[1m";
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const YELLOW: &str = "\x1b[33m";
+const CYAN: &str = "\x1b[36m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
 
-    /// Number of concurrent connections
+struct DownloadResult {
+    url: String,
+    size: usize,
+    speed: f64,
+    elapsed: f64,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "scrippiscrappa", version, about = "A fast, concurrent website scraper.")]
+struct Args {
+    url: String,
     #[arg(short = 'c', default_value_t = 8)]
     connections: usize,
-
-    /// Maximum crawl depth (0 = unlimited)
     #[arg(short = 'd', default_value_t = 0)]
     depth: usize,
-
-    /// Output directory (defaults to current directory)
     #[arg(short = 'o', default_value = ".")]
     output: PathBuf,
 }
@@ -52,242 +62,182 @@ impl Stats {
     }
 }
 
+fn fmt_size(bytes: usize) -> String {
+    let b = bytes as f64;
+    if b < 1024.0 { format!("{} B", bytes) }
+    else if b < 1048576.0 { format!("{:.1} KB", b / 1024.0) }
+    else if b < 1073741824.0 { format!("{:.1} MB", b / 1048576.0) }
+    else { format!("{:.2} GB", b / 1073741824.0) }
+}
+
+fn fmt_speed(bps: f64) -> String {
+    if bps < 1024.0 { format!("{:.0} B/s", bps) }
+    else if bps < 1048576.0 { format!("{:.0} KB/s", bps / 1024.0) }
+    else { format!("{:.1} MB/s", bps / 1048576.0) }
+}
+
 fn normalize_url(input: &str) -> Result<String> {
-    let with_scheme = if input.starts_with("http://") || input.starts_with("https://") {
+    let s = if input.starts_with("http://") || input.starts_with("https://") {
         input.to_string()
     } else {
         format!("https://{}", input)
     };
-    let parsed = url::Url::parse(&with_scheme).context("Invalid URL")?;
-    Ok(parsed.to_string())
+    Ok(url::Url::parse(&s).context("Invalid URL")?.to_string())
 }
 
 fn resolve_url(base: &url::Url, href: &str) -> Option<url::Url> {
-    let href = href.trim();
-    if href.is_empty()
-        || href.starts_with('#')
-        || href.starts_with("javascript:")
-        || href.starts_with("data:")
-        || href.starts_with("mailto:")
-        || href.starts_with("tel:")
-        || href.starts_with("ftp:")
-        || href.starts_with("about:")
-        || href.starts_with("blob:")
-    {
+    let h = href.trim();
+    if h.is_empty() || h.starts_with('#') || h.starts_with("javascript:")
+        || h.starts_with("data:") || h.starts_with("mailto:")
+        || h.starts_with("tel:") || h.starts_with("about:") {
         return None;
     }
-    base.join(href).ok()
+    base.join(h).ok()
 }
 
 fn url_to_filepath(url: &url::Url) -> PathBuf {
     let host = url.host_str().unwrap_or("unknown");
-    let path = url.path();
-
-    let mut parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-    if parts.is_empty() {
-        return PathBuf::from(host).join("index.html");
-    }
-
-    let last = parts.last().copied().unwrap_or("");
-    let has_extension = last.contains('.');
-
-    if !has_extension {
-        parts.push("index.html");
-    }
-
+    let mut parts: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() { return PathBuf::from(host).join("index.html"); }
+    if !parts.last().copied().unwrap_or("").contains('.') { parts.push("index.html"); }
     let mut p = PathBuf::from(host);
-    for part in parts {
-        p.push(part);
-    }
+    for part in parts { p.push(part); }
     p
 }
 
-fn extract_links(html: &str, base: &url::Url, base_domain: &str) -> Vec<String> {
-    let document = Html::parse_document(html);
+fn extract_links(html: &str, base: &url::Url, domain: &str) -> Vec<String> {
+    let doc = Html::parse_document(html);
     let mut urls = Vec::new();
-
-    let selectors: &[(&str, &str)] = &[
-        ("a", "href"),
-        ("link", "href"),
-        ("script", "src"),
-        ("img", "src"),
-        ("img", "srcset"),
-        ("source", "src"),
-        ("source", "srcset"),
-        ("video", "src"),
-        ("video", "poster"),
-        ("audio", "src"),
-        ("embed", "src"),
-        ("object", "data"),
-        ("iframe", "src"),
-        ("frame", "src"),
-        ("meta[http-equiv='refresh']", "content"),
+    let sels: &[(&str, &str)] = &[
+        ("a","href"),("link","href"),("script","src"),("img","src"),
+        ("img","srcset"),("source","src"),("source","srcset"),
+        ("video","src"),("video","poster"),("audio","src"),
+        ("embed","src"),("object","data"),("iframe","src"),
+        ("frame","src"),("meta[http-equiv='refresh']","content"),
     ];
-
-    for (tag, attr) in selectors {
-        let selector_str = if tag.contains('[') {
-            tag.to_string()
-        } else {
-            format!("{}[{}]", tag, attr)
-        };
-        let sel = match Selector::parse(&selector_str) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for element in document.select(&sel) {
-            if let Some(val) = element.value().attr(attr) {
-                if *attr == "srcset" {
-                    for part in val.split(',') {
-                        let trimmed = part.trim();
-                        let url_part = trimmed.split_whitespace().next().unwrap_or("");
-                        if let Some(resolved) = resolve_url(base, url_part) {
-                            if resolved.domain() == Some(base_domain) {
-                                urls.push(resolved.to_string());
-                            }
-                        }
-                    }
+    for (tag, attr) in sels {
+        let sel_str = if tag.contains('[') { tag.to_string() } else { format!("{}[{}]", tag, attr) };
+        let sel = match Selector::parse(&sel_str) { Ok(s) => s, Err(_) => continue };
+        for el in doc.select(&sel) {
+            if let Some(val) = el.value().attr(attr) {
+                let matches = if *attr == "srcset" {
+                    val.split(',').filter_map(|p| {
+                        p.trim().split_whitespace().next()
+                    }).filter_map(|u| resolve_url(base, u))
+                     .filter(|r| r.host_str() == Some(domain))
+                     .map(|r| r.to_string())
+                     .collect::<Vec<_>>()
                 } else if *attr == "content" && *tag == "meta[http-equiv='refresh']" {
-                    if let Some(url_part) =
-                        val.split(';').find(|s| s.trim().starts_with("url="))
-                    {
-                        let href = url_part.trim().strip_prefix("url=").unwrap_or("");
-                        if let Some(resolved) = resolve_url(base, href) {
-                            if resolved.domain() == Some(base_domain) {
-                                urls.push(resolved.to_string());
-                            }
-                        }
-                    }
-                } else if let Some(resolved) = resolve_url(base, val) {
-                    if resolved.domain() == Some(base_domain) {
-                        urls.push(resolved.to_string());
-                    }
-                }
+                    val.split(';').find(|s| s.trim().starts_with("url="))
+                      .and_then(|u| {
+                          let href = u.trim().strip_prefix("url=").unwrap_or("");
+                          resolve_url(base, href).filter(|r| r.host_str() == Some(domain))
+                      })
+                      .map(|r| r.to_string())
+                      .into_iter().collect()
+                } else {
+                    resolve_url(base, val)
+                        .filter(|r| r.host_str() == Some(domain))
+                        .map(|r| r.to_string())
+                        .into_iter().collect()
+                };
+                urls.extend(matches);
             }
         }
     }
-
     urls
 }
 
 fn extract_css_urls(css: &str) -> Vec<String> {
     let mut urls = Vec::new();
-    let mut remaining = css;
-    while let Some(start) = remaining.find("url(") {
-        remaining = &remaining[start + 4..];
-        let end = remaining.find(')').unwrap_or(remaining.len());
-        let inner = remaining[..end]
-            .trim()
-            .trim_matches('\'')
-            .trim_matches('"')
-            .trim();
-        if !inner.is_empty() {
-            urls.push(inner.to_string());
-        }
-        remaining = &remaining[end..];
+    let mut rem = css;
+    while let Some(s) = rem.find("url(") {
+        rem = &rem[s + 4..];
+        let e = rem.find(')').unwrap_or(rem.len());
+        let inner = rem[..e].trim().trim_matches('\'').trim_matches('"').trim();
+        if !inner.is_empty() { urls.push(inner.to_string()); }
+        rem = &rem[e..];
     }
     urls
 }
 
 async fn download_url(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>, String)> {
-    let resp = client
-        .get(url)
-        .header("Accept", "*/*")
-        .send()
-        .await
+    let resp = client.get(url).header("Accept", "*/*").send().await
         .with_context(|| format!("GET {}", url))?;
-
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let body = resp
-        .bytes()
-        .await
-        .with_context(|| format!("reading body of {}", url))?;
-    Ok((body.to_vec(), content_type))
+    let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let body = resp.bytes().await.with_context(|| format!("body of {}", url))?;
+    Ok((body.to_vec(), ct))
 }
 
 async fn save_file(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
+    if let Some(p) = path.parent() { fs::create_dir_all(p).await?; }
     fs::write(path, data).await?;
     Ok(())
+}
+
+fn print_result_line(r: &DownloadResult) {
+    if r.success {
+        eprintln!("  {}↓{} {}{}{}  {}{:.2}s  {}  {}{}",
+            GREEN, RESET, CYAN, r.url, RESET,
+            DIM, r.elapsed, fmt_speed(r.speed), fmt_size(r.size), RESET);
+    } else {
+        let err = r.error.as_deref().unwrap_or("unknown");
+        eprintln!("  {}✗{} {}{}{}  {}{}{}",
+            RED, RESET, CYAN, r.url, RESET, RED, err, RESET);
+    }
 }
 
 fn print_progress(state: &CrawlState, start: Instant) {
     let dl = state.stats.downloaded.load(Ordering::Relaxed);
     let q = state.queued.load(Ordering::Relaxed);
-    let active = state.active_tasks.load(Ordering::Relaxed);
-    let fail = state.stats.failed.load(Ordering::Relaxed);
-    let bytes = state.stats.bytes.load(Ordering::Relaxed);
-    let elapsed = start.elapsed().as_secs_f64();
-    let speed = if elapsed > 0.0 {
-        dl as f64 / elapsed
-    } else {
-        0.0
-    };
-    let mb = bytes as f64 / (1024.0 * 1024.0);
+    let a = state.active_tasks.load(Ordering::Relaxed);
+    let f = state.stats.failed.load(Ordering::Relaxed);
+    let b = state.stats.bytes.load(Ordering::Relaxed);
+    let e = start.elapsed().as_secs_f64();
+    let sp = if e > 0.0 { dl as f64 / e } else { 0.0 };
+    let mb = b as f64 / 1048576.0;
 
-    eprint!(
-        "\r\x1b[K  dl: {} | queue: {} | active: {} | fail: {} | {:.1} MB | {:.1} f/s | {:.0}s",
-        dl, q, active, fail, mb, speed, elapsed
-    );
+    eprint!("\r\x1b[K  ");
+    eprint!("{}dl: {}{}{} | ", GREEN, BOLD, dl, RESET);
+    eprint!("{}q: {}{}{} | ", CYAN, BOLD, q, RESET);
+    if a > 0 { eprint!("{}a: {}{}{} | ", YELLOW, BOLD, a, RESET); }
+    else { eprint!("a: 0 | "); }
+    if f > 0 { eprint!("{}f: {}{}{} | ", RED, BOLD, f, RESET); }
+    else { eprint!("f: 0 | "); }
+    eprint!("{:.1} MB | ", mb);
+    eprint!("{}{:.0} f/s{} | ", DIM, sp, RESET);
+    eprint!("{:.0}s", e);
 }
 
-fn enqueue_url(
-    url: String,
-    depth: usize,
-    max_depth: usize,
-    state: &CrawlState,
-    tx: &mpsc::UnboundedSender<(String, usize)>,
-) {
-    if max_depth > 0 && depth > max_depth {
-        return;
+fn enqueue(url: String, depth: usize, max: usize, state: &CrawlState, tx: &mpsc::UnboundedSender<(String, usize)>) {
+    if max == 0 || depth <= max {
+        state.queued.fetch_add(1, Ordering::Relaxed);
+        let _ = tx.send((url, depth));
     }
-    state.queued.fetch_add(1, Ordering::Relaxed);
-    let _ = tx.send((url, depth));
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
     let start_url = normalize_url(&args.url)?;
-    let parsed_start = url::Url::parse(&start_url)?;
-    let base_domain = parsed_start
-        .domain()
-        .context("URL has no domain")?
-        .to_string();
+    let parsed = url::Url::parse(&start_url)?;
+    let domain = parsed.host_str().context("no host")?.to_string();
 
-    eprintln!("scrippiscrappa");
-    eprintln!("  url:         {}", start_url);
-    eprintln!("  domain:      {}", base_domain);
-    eprintln!("  connections: {}", args.connections);
-    eprintln!(
-        "  depth:       {}",
-        if args.depth == 0 {
-            "unlimited".to_string()
-        } else {
-            args.depth.to_string()
-        }
-    );
-    eprintln!("  output:      {}", args.output.display());
+    eprintln!("{}{}scrippiscrappa{}", BOLD, CYAN, RESET);
+    eprintln!("  {}url:{}    {}", DIM, RESET, start_url);
+    eprintln!("  {}host:{}   {}", DIM, RESET, domain);
+    eprintln!("  {}conn:{}   {}", DIM, RESET, args.connections);
+    eprintln!("  {}depth:{}  {}", DIM, RESET, if args.depth == 0 { "unlimited".into() } else { args.depth.to_string() });
+    eprintln!("  {}out:{}    {}", DIM, RESET, args.output.display());
     eprintln!();
 
-    let output_dir = args.output.canonicalize().unwrap_or(args.output.clone());
-
+    let out_dir = args.output.canonicalize().unwrap_or(args.output.clone());
     let client = reqwest::Client::builder()
         .user_agent("scrippiscrappa/0.1.0")
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .gzip(true)
-        .brotli(true)
-        .deflate(true)
+        .gzip(true).brotli(true).deflate(true)
         .build()?;
 
     let state = Arc::new(CrawlState {
@@ -297,132 +247,102 @@ async fn main() -> Result<()> {
         queued: AtomicUsize::new(0),
     });
 
-    let semaphore = Arc::new(Semaphore::new(args.connections));
-
+    let sem = Arc::new(Semaphore::new(args.connections));
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, usize)>();
+    let (rtx, mut rrx) = mpsc::unbounded_channel::<DownloadResult>();
 
-    // Mark seed as visited and enqueue
-    {
-        state.visited.lock().await.insert(start_url.clone());
-    }
+    { state.visited.lock().await.insert(start_url.clone()); }
     state.queued.fetch_add(1, Ordering::Relaxed);
     tx.send((start_url, 0))?;
 
-    let start_time = Instant::now();
+    let t0 = Instant::now();
 
-    // Progress ticker
-    let state_tick = state.clone();
-    let tick = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            print_progress(&state_tick, start_time);
-            if state_tick.queued.load(Ordering::Relaxed) == 0
-                && state_tick.active_tasks.load(Ordering::Relaxed) == 0
-            {
-                break;
-            }
-        }
-    });
-
-    while let Some((url, depth)) = rx.recv().await {
-        let permit = semaphore.clone().acquire_owned().await?;
-
-        state.active_tasks.fetch_add(1, Ordering::Relaxed);
-
-        let client = client.clone();
-        let output_dir = output_dir.clone();
-        let base_domain = base_domain.clone();
-        let state = state.clone();
-        let tx = tx.clone();
-        let max_depth = args.depth;
-
-        tokio::spawn(async move {
-            let _permit = permit;
-
-            match download_url(&client, &url).await {
-                Ok((body, content_type)) => {
-                    let parsed = url::Url::parse(&url).ok();
-                    let is_same_domain = parsed
-                        .as_ref()
-                        .and_then(|u| u.domain())
-                        .map(|d| d == base_domain)
-                        .unwrap_or(false);
-
-                    // Save file
-                    let filepath = parsed
-                        .as_ref()
-                        .map(url_to_filepath)
-                        .unwrap_or_else(|| PathBuf::from("unknown"));
-                    let full_path = output_dir.join(&filepath);
-                    if let Err(e) = save_file(&full_path, &body).await {
-                        eprintln!("\n  error saving {}: {}", filepath.display(), e);
-                        state.stats.failed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        state.stats.downloaded.fetch_add(1, Ordering::Relaxed);
-                        state.stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                    }
-
-                    // Extract links from HTML
-                    if is_same_domain && content_type.contains("text/html") {
-                        if let (Ok(html), Some(p)) = (std::str::from_utf8(&body), parsed.as_ref())
-                        {
-                            let links = extract_links(html, p, &base_domain);
-                            for link in links {
-                                let mut visited = state.visited.lock().await;
-                                if visited.insert(link.clone()) {
-                                    drop(visited);
-                                    enqueue_url(link, depth + 1, max_depth, &state, &tx);
+    loop {
+        match rx.try_recv() {
+            Ok((url, depth)) => {
+                let permit = sem.clone().acquire_owned().await?;
+                state.active_tasks.fetch_add(1, Ordering::Relaxed);
+                let (c, o, d, s, tx, rtx, md) = (
+                    client.clone(), out_dir.clone(), domain.clone(),
+                    state.clone(), tx.clone(), rtx.clone(), args.depth,
+                );
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let t1 = Instant::now();
+                    match download_url(&c, &url).await {
+                        Ok((body, ct)) => {
+                            let el = t1.elapsed().as_secs_f64();
+                            let sz = body.len();
+                            let spd = if el > 0.0 { sz as f64 / el } else { 0.0 };
+                            let parsed = url::Url::parse(&url).ok();
+                            let same = parsed.as_ref().and_then(|u| u.host_str()).map(|h| h == d).unwrap_or(false);
+                            let fp = parsed.as_ref().map(url_to_filepath).unwrap_or_else(|| PathBuf::from("unknown"));
+                            if let Err(e) = save_file(&o.join(&fp), &body).await {
+                                let _ = rtx.send(DownloadResult { url: url.clone(), size: sz, speed: spd, elapsed: el, success: false, error: Some(format!("{}", e)) });
+                                s.stats.failed.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                let _ = rtx.send(DownloadResult { url: url.clone(), size: sz, speed: spd, elapsed: el, success: true, error: None });
+                                s.stats.downloaded.fetch_add(1, Ordering::Relaxed);
+                                s.stats.bytes.fetch_add(sz as u64, Ordering::Relaxed);
+                            }
+                            if same && ct.contains("text/html") {
+                                if let (Ok(h), Some(p)) = (std::str::from_utf8(&body), parsed.as_ref()) {
+                                    for link in extract_links(h, p, &d) {
+                                        let mut v = s.visited.lock().await;
+                                        if v.insert(link.clone()) { drop(v); enqueue(link, depth+1, md, &s, &tx); }
+                                    }
                                 }
                             }
-                        }
-                    }
-
-                    // Extract URLs from CSS
-                    if is_same_domain && content_type.contains("text/css") {
-                        if let (Ok(css), Some(p)) = (std::str::from_utf8(&body), parsed.as_ref()) {
-                            for href in extract_css_urls(css) {
-                                if let Some(resolved) = resolve_url(p, &href) {
-                                    if resolved.domain() == Some(base_domain.as_str()) {
-                                        let r = resolved.to_string();
-                                        let mut visited = state.visited.lock().await;
-                                        if visited.insert(r.clone()) {
-                                            drop(visited);
-                                            enqueue_url(r, depth + 1, max_depth, &state, &tx);
+                            if same && ct.contains("text/css") {
+                                if let (Ok(css), Some(p)) = (std::str::from_utf8(&body), parsed.as_ref()) {
+                                    for href in extract_css_urls(css) {
+                                        if let Some(r) = resolve_url(p, &href) {
+                                            if r.host_str() == Some(d.as_str()) {
+                                                let rs = r.to_string();
+                                                let mut v = s.visited.lock().await;
+                                                if v.insert(rs.clone()) { drop(v); enqueue(rs, depth+1, md, &s, &tx); }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                }
                         Err(e) => {
-                            eprintln!("\n  failed: {} — {:#}", url, e);
-                            state.stats.failed.fetch_add(1, Ordering::Relaxed);
+                            let el = t1.elapsed().as_secs_f64();
+                            let _ = rtx.send(DownloadResult { url: url.clone(), size: 0, speed: 0.0, elapsed: el, success: false, error: Some(format!("{:#}", e)) });
+                            s.stats.failed.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+                    s.queued.fetch_sub(1, Ordering::Relaxed);
+                    s.active_tasks.fetch_sub(1, Ordering::Relaxed);
+                });
             }
-
-            state.queued.fetch_sub(1, Ordering::Relaxed);
-            state.active_tasks.fetch_sub(1, Ordering::Relaxed);
-        });
+            Err(_) => {
+                while let Ok(r) = rrx.try_recv() { print_result_line(&r); }
+                print_progress(&state, t0);
+                if state.queued.load(Ordering::Relaxed) == 0
+                    && state.active_tasks.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 
-    // Wait for progress ticker to finish
-    let _ = tick.await;
-
-    print_progress(&state, start_time);
+    while let Ok(r) = rrx.try_recv() { print_result_line(&r); }
+    print_progress(&state, t0);
     eprintln!();
 
-    let elapsed = start_time.elapsed();
+    let el = t0.elapsed();
     let dl = state.stats.downloaded.load(Ordering::Relaxed);
-    let fail = state.stats.failed.load(Ordering::Relaxed);
-    let bytes = state.stats.bytes.load(Ordering::Relaxed);
+    let fl = state.stats.failed.load(Ordering::Relaxed);
+    let bt = state.stats.bytes.load(Ordering::Relaxed);
 
     eprintln!();
-    eprintln!("done in {:.1}s", elapsed.as_secs_f64());
-    eprintln!("  downloaded: {}", dl);
-    eprintln!("  failed:     {}", fail);
-    eprintln!("  total:      {:.2} MB", bytes as f64 / (1024.0 * 1024.0));
+    eprintln!("{}done{} in {}{:.1}s{}", BOLD, RESET, DIM, el.as_secs_f64(), RESET);
+    eprintln!("  {}{}{} downloaded", GREEN, dl, RESET);
+    if fl > 0 { eprintln!("  {}{}{} failed", RED, fl, RESET); }
+    eprintln!("  {}{:.2} MB{} total", BOLD, bt as f64 / 1048576.0, RESET);
 
     Ok(())
 }
