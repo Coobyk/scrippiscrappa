@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -95,6 +96,10 @@ struct Args {
     output: PathBuf,
     #[arg(long = "no-limits")]
     no_limits: bool,
+    #[arg(short = 'z', long = "7z", help = "Create a .7z archive (requires 7z)")]
+    archive_7z: bool,
+    #[arg(long = "zip", help = "Create a .zip archive")]
+    archive_zip: bool,
 }
 
 struct CrawlState {
@@ -314,6 +319,56 @@ fn enqueue(url: String, depth: usize, max: usize, state: &CrawlState, tx: &mpsc:
     }
 }
 
+fn is_domain_dir(path: &Path) -> bool {
+    path.is_dir() && path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains('.') && !n.starts_with('.'))
+        .unwrap_or(false)
+}
+
+fn collect_domain_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if is_domain_dir(&entry.path()) {
+                result.push(entry.path());
+            }
+        }
+    }
+    result.sort();
+    result
+}
+
+fn create_zip(dirs: &[PathBuf], base: &Path, out: &Path) -> Result<()> {
+    let file = std::fs::File::create(out)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut buf = Vec::new();
+    let mut stack = Vec::new();
+    for dir in dirs {
+        stack.clear();
+        stack.push(dir.clone());
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d)? {
+                let entry = entry?;
+                let path = entry.path();
+                let rel = path.strip_prefix(base)?;
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    buf.clear();
+                    let mut f = std::fs::File::open(&path)?;
+                    std::io::Read::read_to_end(&mut f, &mut buf)?;
+                    zip.start_file(rel.to_string_lossy(), opts)?;
+                    zip.write_all(&buf)?;
+                }
+            }
+        }
+    }
+    zip.finish()?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -450,6 +505,47 @@ async fn main() -> Result<()> {
     let sk = state.stats.skipped.load(Ordering::Relaxed);
     if sk > 0 { eprintln!("  {}{}{} skipped (loop/bad url)", DIM, sk, RESET); }
     eprintln!("  {}{:.2} MB{} total", BOLD, bt as f64 / 1048576.0, RESET);
+
+    if args.archive_7z || args.archive_zip {
+        eprintln!();
+        let domains = collect_domain_dirs(&out_dir);
+        if domains.is_empty() {
+            eprintln!("  {}no domain directories found to archive{}", RED, RESET);
+        } else {
+
+        if args.archive_7z {
+            let archive_name = format!("{}.7z", domain);
+            let archive_path = out_dir.join(&archive_name);
+            eprint!("  {}7z{} → {}{}{} ... ", BOLD, RESET, DIM, archive_name, RESET);
+            let mut cmd = std::process::Command::new("7z");
+            cmd.args(["a", "-y"]).arg(&archive_path);
+            for d in &domains { cmd.arg(d); }
+            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            match cmd.status() {
+                Ok(s) if s.success() => {
+                    let size = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+                    eprintln!("{}done{} ({})", GREEN, RESET, fmt_size(size as usize));
+                }
+                Ok(s) => eprintln!("{}failed{} (exit code {})", RED, RESET, s),
+                Err(e) => eprintln!("{}failed{} ({})", RED, RESET, e),
+            }
+        }
+
+        if args.archive_zip {
+            let archive_name = format!("{}.zip", domain);
+            let archive_path = out_dir.join(&archive_name);
+            eprint!("  {}zip{} → {}{}{} ... ", BOLD, RESET, DIM, archive_name, RESET);
+            match create_zip(&domains, &out_dir, &archive_path) {
+                Ok(()) => {
+                    let size = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+                    eprintln!("{}done{} ({})", GREEN, RESET, fmt_size(size as usize));
+                }
+                Err(e) => eprintln!("{}failed{} ({})", RED, RESET, e),
+            }
+        }
+
+        }
+    }
 
     Ok(())
 }
