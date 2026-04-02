@@ -1,2 +1,2 @@
-# scrippiscrappa2
+# scrippiscrappa
 Scraper written in Rust
