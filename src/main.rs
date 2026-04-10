@@ -146,15 +146,18 @@ struct Args {
     archive_7z: bool,
     #[arg(long = "zip", help = "Create a .zip archive")]
     archive_zip: bool,
+    #[arg(short = 'r', default_value_t = 10)]
+    retries: usize,
 }
 
 // Shared crawl state across all async tasks
 struct CrawlState {
-    visited: Mutex<HashSet<String>>, // Track visited URLs to avoid duplicates
-    stats: Stats,                    // Download statistics counters
-    active_tasks: AtomicUsize,       // Number of active download tasks
-    queued: AtomicUsize,             // Number of URLs waiting in queue
-    speed_log: StdMutex<VecDeque<(Instant, u64)>>, // Rolling window for speed calculation
+    visited: Mutex<HashSet<String>>,
+    stats: Stats,
+    active_tasks: AtomicUsize,
+    queued: AtomicUsize,
+    speed_log: StdMutex<VecDeque<(Instant, u64)>>,
+    failed_urls: StdMutex<Vec<String>>,
 }
 
 // Statistics counters (atomic for thread-safe updates)
@@ -580,6 +583,7 @@ async fn main() -> Result<()> {
         active_tasks: AtomicUsize::new(0),
         queued: AtomicUsize::new(0),
         speed_log: StdMutex::new(VecDeque::new()),
+        failed_urls: StdMutex::new(Vec::new()),
     });
     // Track which domains were successfully downloaded (for archiving)
     let successful_domains: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -617,7 +621,7 @@ async fn main() -> Result<()> {
                         state.active_tasks.fetch_add(1, Ordering::Relaxed);
 
                         // Clone all required data for the spawned task
-                        let (c, o, d, s, tx, rtx, md, nl, successful_domains) = (
+                        let (c, o, d, s, tx, rtx, md, nl, successful_domains, retries) = (
                             client.clone(),
                             out_dir.clone(),
                             domain.clone(),
@@ -627,6 +631,7 @@ async fn main() -> Result<()> {
                             args.depth,
                             args.no_limits,
                             successful_domains.clone(),
+                            args.retries,
                         );
 
                         // Spawn async worker to download URL and process results
@@ -634,114 +639,134 @@ async fn main() -> Result<()> {
                             let _permit = permit;  // Release permit when task completes
                             let t1 = Instant::now();
 
-                            // Download the URL
-                            match download_url(&c, &url).await {
-                                Ok((body, ct)) => {
-                                    let el = t1.elapsed().as_secs_f64();
-                                    let sz = body.len();
-                                    let spd = if el > 0.0 { sz as f64 / el } else { 0.0 };
-                                    let parsed = url::Url::parse(&url).ok();
-                                    let same = parsed
-                                        .as_ref()
-                                        .and_then(|u| u.host_str())
-                                        .map(|h| h == d)
-                                        .unwrap_or(false);
-                                    let fp = parsed
-                                        .as_ref()
-                                        .map(url_to_filepath)
-                                        .unwrap_or_else(|| PathBuf::from("unknown"));
+                            let mut last_error = None;
+                            let mut download_success = false;
+                            let mut body = Vec::new();
+                            let mut ct = String::new();
 
-                                    // Save file to disk
-                                    if let Err(e) = save_file(&o.join(&fp), &body).await {
-                                        let _ = rtx.send(DownloadResult {
-                                            url: url.clone(),
-                                            size: sz,
-                                            speed: spd,
-                                            elapsed: el,
-                                            success: false,
-                                            error: Some(format!("{}", e)),
-                                            url_type: classify_url(&ct, &url),
-                                        });
-                                        s.stats.failed.fetch_add(1, Ordering::Relaxed);
-                                    // File saved successfully - update statistics
-                                    } else {
-                                        let ut = classify_url(&ct, &url);
-                                        // Track successful domain for archiving
-                                        if let Some(host) = parsed.as_ref().and_then(|u| u.host_str()) {
-                                            successful_domains.lock().await.insert(host.to_string());
-                                        }
-                                        // Log download for speed calculation
-                                        {
-                                            let mut log = s.speed_log.lock().unwrap();
-                                            log.push_back((Instant::now(), sz as u64));
-                                        }
-                                        // Send success result to display channel
-                                        let _ = rtx.send(DownloadResult {
-                                            url: url.clone(),
-                                            size: sz,
-                                            speed: spd,
-                                            elapsed: el,
-                                            success: true,
-                                            error: None,
-                                            url_type: ut,
-                                        });
-                                        s.stats.downloaded.fetch_add(1, Ordering::Relaxed);
-                                        s.stats.bytes.fetch_add(sz as u64, Ordering::Relaxed);
+                            for attempt in 0..retries {
+                                match download_url(&c, &url).await {
+                                    Ok((b, ctype)) => {
+                                        body = b;
+                                        ct = ctype;
+                                        download_success = true;
+                                        break;
                                     }
+                                    Err(e) => {
+                                        last_error = Some(e);
+                                        if attempt < retries - 1 {
+                                            tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+                                        }
+                                    }
+                                }
+                            }
 
-                                    // Parse HTML to extract and enqueue discovered links
-                                    if same && ct.contains("text/html") {
-                                        if let (Ok(h), Some(p)) =
-                                            (std::str::from_utf8(&body), parsed.as_ref())
-                                        {
-                                            for link in extract_links(h, p, &d) {
-                                                if !is_sane_url(&link, nl) {
-                                                    continue;
-                                                }
-                                                let mut v = s.visited.lock().await;
-                                                if v.insert(link.clone()) {
-                                                    drop(v);
-                                                    enqueue(link, depth + 1, md, &s, &tx, nl);
-                                                }
+                            if download_success {
+                                let el = t1.elapsed().as_secs_f64();
+                                let sz = body.len();
+                                let spd = if el > 0.0 { sz as f64 / el } else { 0.0 };
+                                let parsed = url::Url::parse(&url).ok();
+                                let same = parsed
+                                    .as_ref()
+                                    .and_then(|u| u.host_str())
+                                    .map(|h| h == d)
+                                    .unwrap_or(false);
+                                let fp = parsed
+                                    .as_ref()
+                                    .map(url_to_filepath)
+                                    .unwrap_or_else(|| PathBuf::from("unknown"));
+
+                                if let Err(e) = save_file(&o.join(&fp), &body).await {
+                                    let _ = rtx.send(DownloadResult {
+                                        url: url.clone(),
+                                        size: sz,
+                                        speed: spd,
+                                        elapsed: el,
+                                        success: false,
+                                        error: Some(format!("{}", e)),
+                                        url_type: classify_url(&ct, &url),
+                                    });
+                                    s.stats.failed.fetch_add(1, Ordering::Relaxed);
+                                    {
+                                        let mut failed = s.failed_urls.lock().unwrap();
+                                        failed.push(url.clone());
+                                    }
+                                } else {
+                                    let ut = classify_url(&ct, &url);
+                                    if let Some(host) = parsed.as_ref().and_then(|u| u.host_str()) {
+                                        successful_domains.lock().await.insert(host.to_string());
+                                    }
+                                    {
+                                        let mut log = s.speed_log.lock().unwrap();
+                                        log.push_back((Instant::now(), sz as u64));
+                                    }
+                                    let _ = rtx.send(DownloadResult {
+                                        url: url.clone(),
+                                        size: sz,
+                                        speed: spd,
+                                        elapsed: el,
+                                        success: true,
+                                        error: None,
+                                        url_type: ut,
+                                    });
+                                    s.stats.downloaded.fetch_add(1, Ordering::Relaxed);
+                                    s.stats.bytes.fetch_add(sz as u64, Ordering::Relaxed);
+                                }
+
+                                if same && ct.contains("text/html") {
+                                    if let (Ok(h), Some(p)) =
+                                        (std::str::from_utf8(&body), parsed.as_ref())
+                                    {
+                                        for link in extract_links(h, p, &d) {
+                                            if !is_sane_url(&link, nl) {
+                                                continue;
+                                            }
+                                            let mut v = s.visited.lock().await;
+                                            if v.insert(link.clone()) {
+                                                drop(v);
+                                                enqueue(link, depth + 1, md, &s, &tx, nl);
                                             }
                                         }
                                     }
+                                }
 
-                                    // Parse CSS to extract @import and url() references
-                                    if same && ct.contains("text/css") {
-                                        if let (Ok(css), Some(p)) =
-                                            (std::str::from_utf8(&body), parsed.as_ref())
-                                        {
-                                            for href in extract_css_urls(css) {
-                                                if let Some(r) = resolve_url(p, &href) {
-                                                    if r.host_str() == Some(d.as_str()) {
-                                                        let rs = r.to_string();
-                                                        if !is_sane_url(&rs, nl) {
-                                                            continue;
-                                                        }
-                                                        let mut v = s.visited.lock().await;
-                                                        if v.insert(rs.clone()) {
-                                                            drop(v);
-                                                            enqueue(rs, depth + 1, md, &s, &tx, nl);
-                                                        }
+                                if same && ct.contains("text/css") {
+                                    if let (Ok(css), Some(p)) =
+                                        (std::str::from_utf8(&body), parsed.as_ref())
+                                    {
+                                        for href in extract_css_urls(css) {
+                                            if let Some(r) = resolve_url(p, &href) {
+                                                if r.host_str() == Some(d.as_str()) {
+                                                    let rs = r.to_string();
+                                                    if !is_sane_url(&rs, nl) {
+                                                        continue;
+                                                    }
+                                                    let mut v = s.visited.lock().await;
+                                                    if v.insert(rs.clone()) {
+                                                        drop(v);
+                                                        enqueue(rs, depth + 1, md, &s, &tx, nl);
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    let el = t1.elapsed().as_secs_f64();
-                                    let _ = rtx.send(DownloadResult {
-                                        url: url.clone(),
-                                        size: 0,
-                                        speed: 0.0,
-                                        elapsed: el,
-                                        success: false,
-                                        error: Some(format!("{:#}", e)),
-                                        url_type: classify_url("", &url),
-                                    });
-                                    s.stats.failed.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                let el = t1.elapsed().as_secs_f64();
+                                let err = last_error.map(|e| format!("{:#}", e)).unwrap_or_else(|| "max retries".to_string());
+                                let _ = rtx.send(DownloadResult {
+                                    url: url.clone(),
+                                    size: 0,
+                                    speed: 0.0,
+                                    elapsed: el,
+                                    success: false,
+                                    error: Some(err),
+                                    url_type: classify_url("", &url),
+                                });
+                                s.stats.failed.fetch_add(1, Ordering::Relaxed);
+                                {
+                                    let mut failed = s.failed_urls.lock().unwrap();
+                                    failed.push(url.clone());
                                 }
                             }
                             s.queued.fetch_sub(1, Ordering::Relaxed);
@@ -807,6 +832,20 @@ async fn main() -> Result<()> {
         eprintln!("  {}{}{} skipped (loop/bad url)", DIM, sk, RESET);
     }
     eprintln!("  {}{:.2} MB{} total", BOLD, bt as f64 / 1048576.0, RESET);
+
+    {
+        let failed: Vec<String> = {
+            let mut f = state.failed_urls.lock().unwrap();
+            std::mem::take(&mut *f)
+        };
+        if !failed.is_empty() {
+            eprintln!();
+            eprintln!("{}Failed URLs ({}):{}", RED, BOLD, RESET);
+            for url in failed {
+                eprintln!("  {}", url);
+            }
+        }
+    }
 
     if args.archive_7z || args.archive_zip {
         eprintln!();
