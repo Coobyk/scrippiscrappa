@@ -1,4 +1,5 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -399,6 +400,7 @@ async fn main() -> Result<()> {
         queued: AtomicUsize::new(0),
         speed_log: StdMutex::new(VecDeque::new()),
     });
+    let successful_domains: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let sem = Arc::new(Semaphore::new(args.connections));
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, usize)>();
@@ -415,9 +417,10 @@ async fn main() -> Result<()> {
             Ok((url, depth)) => {
                 let permit = sem.clone().acquire_owned().await?;
                 state.active_tasks.fetch_add(1, Ordering::Relaxed);
-                let (c, o, d, s, tx, rtx, md, nl) = (
+                let (c, o, d, s, tx, rtx, md, nl, successful_domains) = (
                     client.clone(), out_dir.clone(), domain.clone(),
                     state.clone(), tx.clone(), rtx.clone(), args.depth, args.no_limits,
+                    successful_domains.clone(),
                 );
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -435,6 +438,9 @@ async fn main() -> Result<()> {
                                 s.stats.failed.fetch_add(1, Ordering::Relaxed);
                             } else {
                                 let ut = classify_url(&ct, &url);
+                                if let Some(host) = parsed.as_ref().and_then(|u| u.host_str()) {
+                                    successful_domains.lock().await.insert(host.to_string());
+                                }
                                 {
                                     let mut log = s.speed_log.lock().unwrap();
                                     log.push_back((Instant::now(), sz as u64));
@@ -508,9 +514,13 @@ async fn main() -> Result<()> {
 
     if args.archive_7z || args.archive_zip {
         eprintln!();
-        let domains = collect_domain_dirs(&out_dir);
+        let mut domains: Vec<PathBuf> = {
+            let successful_domains = successful_domains.lock().await;
+            successful_domains.iter().map(|d| out_dir.join(d)).collect()
+        };
+        domains.sort();
         if domains.is_empty() {
-            eprintln!("  {}no domain directories found to archive{}", RED, RESET);
+            eprintln!("  {}no successful domain directories found to archive{}", RED, RESET);
         } else {
 
         if args.archive_7z {
