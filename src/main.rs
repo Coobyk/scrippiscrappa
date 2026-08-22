@@ -148,6 +148,56 @@ struct Args {
     archive_zip: bool,
     #[arg(short = 'r', default_value_t = 10)]
     retries: usize,
+    #[arg(
+        short = 's',
+        long = "subdomains",
+        num_args = 0..=1,
+        default_value = None,
+        help = "Also follow subdomains: bare -s for all, or a comma-separated list e.g. \"www,blog,docs\""
+    )]
+    subdomains: Option<String>,
+}
+
+// Host matching policy determining which URLs are followed and downloaded
+#[derive(Clone)]
+enum DomainMatch {
+    // Only the exact start domain
+    Exact(String),
+    // The start domain plus any subdomain of it
+    AnySub(String),
+    // The start domain plus specific subdomains
+    List(String, Vec<String>),
+}
+
+impl DomainMatch {
+    fn new(domain: &str, arg: Option<&str>) -> Self {
+        match arg.map(str::trim).filter(|s| !s.is_empty()) {
+            None => DomainMatch::Exact(domain.to_string()),
+            Some("*") | Some("-") => DomainMatch::AnySub(domain.to_string()),
+            Some(list) => DomainMatch::List(
+                domain.to_string(),
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_lowercase)
+                    .collect(),
+            ),
+        }
+    }
+
+    fn matches(&self, host: Option<&str>) -> bool {
+        let Some(h) = host else { return false };
+        match self {
+            DomainMatch::Exact(d) => h == d,
+            DomainMatch::AnySub(d) => h == d || h.ends_with(&format!(".{}", d)),
+            DomainMatch::List(d, subs) => {
+                h == d
+                    || subs.iter().any(|s| {
+                        h == format!("{}.{}", s, d) || h.ends_with(&format!(".{}.{}", s, d))
+                    })
+            }
+        }
+    }
 }
 
 // Shared crawl state across all async tasks
@@ -253,7 +303,7 @@ fn url_to_filepath(url: &url::Url) -> PathBuf {
 // Scans: <a href>, <link href>, <script src>, <img src>, <img srcset>, <source src>,
 //        <source srcset>, <video src/poster>, <audio src>, <embed src>, <object data>,
 //        <iframe src>, <frame src>, <meta http-equiv='refresh'>
-fn extract_links(html: &str, base: &url::Url, domain: &str) -> Vec<String> {
+fn extract_links(html: &str, base: &url::Url, dm: &DomainMatch) -> Vec<String> {
     let doc = Html::parse_document(html);
     let mut urls = Vec::new();
 
@@ -291,7 +341,7 @@ fn extract_links(html: &str, base: &url::Url, domain: &str) -> Vec<String> {
                     val.split(',')
                         .filter_map(|p| p.split_whitespace().next())
                         .filter_map(|u| resolve_url(base, u))
-                        .filter(|r| r.host_str() == Some(domain))
+                        .filter(|r| dm.matches(r.host_str()))
                         .map(|r| r.to_string())
                         .collect::<Vec<_>>()
                 } else if *attr == "content" && *tag == "meta[http-equiv='refresh']" {
@@ -299,14 +349,14 @@ fn extract_links(html: &str, base: &url::Url, domain: &str) -> Vec<String> {
                         .find(|s| s.trim().starts_with("url="))
                         .and_then(|u| {
                             let href = u.trim().strip_prefix("url=").unwrap_or("");
-                            resolve_url(base, href).filter(|r| r.host_str() == Some(domain))
+                            resolve_url(base, href).filter(|r| dm.matches(r.host_str()))
                         })
                         .map(|r| r.to_string())
                         .into_iter()
                         .collect()
                 } else {
                     resolve_url(base, val)
-                        .filter(|r| r.host_str() == Some(domain))
+                        .filter(|r| dm.matches(r.host_str()))
                         .map(|r| r.to_string())
                         .into_iter()
                         .collect()
@@ -547,10 +597,22 @@ async fn main() -> Result<()> {
     let start_url = normalize_url(&args.url)?;
     let parsed = url::Url::parse(&start_url)?;
     let domain = parsed.host_str().context("no host")?.to_string();
+    let domain_match = DomainMatch::new(&domain, args.subdomains.as_deref());
 
     eprintln!("{}{}scrippiscrappa{}", BOLD, CYAN, RESET);
     eprintln!("  {}url:{}    {}", DIM, RESET, start_url);
     eprintln!("  {}host:{}   {}", DIM, RESET, domain);
+    eprintln!(
+        "  {}subs:{}   {}",
+        DIM,
+        RESET,
+        match &domain_match {
+            DomainMatch::Exact(_) => "disabled".to_string(),
+            DomainMatch::AnySub(_) => "all".to_string(),
+            DomainMatch::List(_, subs) if subs.is_empty() => "none".to_string(),
+            DomainMatch::List(_, subs) => subs.join(","),
+        }
+    );
     eprintln!("  {}conn:{}   {}", DIM, RESET, args.connections);
     eprintln!(
         "  {}depth:{}  {}",
@@ -621,10 +683,10 @@ async fn main() -> Result<()> {
                         state.active_tasks.fetch_add(1, Ordering::Relaxed);
 
                         // Clone all required data for the spawned task
-                        let (c, o, d, s, tx, rtx, md, nl, successful_domains, retries) = (
+                        let (c, o, dm, s, tx, rtx, md, nl, successful_domains, retries) = (
                             client.clone(),
-                            out_dir.clone(),
-                            domain.clone(),
+                            out_dir.join(&domain),
+                            domain_match.clone(),
                             state.clone(),
                             tx.clone(),
                             rtx.clone(),
@@ -666,11 +728,7 @@ async fn main() -> Result<()> {
                                 let sz = body.len();
                                 let spd = if el > 0.0 { sz as f64 / el } else { 0.0 };
                                 let parsed = url::Url::parse(&url).ok();
-                                let same = parsed
-                                    .as_ref()
-                                    .and_then(|u| u.host_str())
-                                    .map(|h| h == d)
-                                    .unwrap_or(false);
+                                let same = dm.matches(parsed.as_ref().and_then(|u| u.host_str()));
                                 let fp = parsed
                                     .as_ref()
                                     .map(url_to_filepath)
@@ -717,7 +775,7 @@ async fn main() -> Result<()> {
                                     if let (Ok(h), Some(p)) =
                                         (std::str::from_utf8(&body), parsed.as_ref())
                                     {
-                                        for link in extract_links(h, p, &d) {
+                                        for link in extract_links(h, p, &dm) {
                                             if !is_sane_url(&link, nl) {
                                                 continue;
                                             }
@@ -736,7 +794,7 @@ async fn main() -> Result<()> {
                                     {
                                         for href in extract_css_urls(css) {
                                             if let Some(r) = resolve_url(p, &href) {
-                                                if r.host_str() == Some(d.as_str()) {
+                                                if dm.matches(r.host_str()) {
                                                     let rs = r.to_string();
                                                     if !is_sane_url(&rs, nl) {
                                                         continue;
@@ -851,7 +909,11 @@ async fn main() -> Result<()> {
         eprintln!();
         let mut domains: Vec<PathBuf> = {
             let successful_domains = successful_domains.lock().await;
-            successful_domains.iter().map(|d| out_dir.join(d)).collect()
+            if successful_domains.is_empty() {
+                Vec::new()
+            } else {
+                vec![out_dir.join(&domain)]
+            }
         };
         domains.sort();
         if domains.is_empty() {
